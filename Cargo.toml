@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Це "золотий стандарт" на 2025/2026 рік для TUI
-ratatui = "0.29.0"       # Нова стабільна версія
-tui-textarea = "0.7.0"   # Оновлена версія, яка дружить з ratatui 0.29
-crossterm = "0.28.1"     # Сумісна версія для клавіатури
+ratatui = "0.29.0"
+tui-textarea = "0.7.0"
+crossterm = "0.28.1"
 anyhow = "1.0"
 directories = "5.0"
 sysinfo = "0.30.5"
+encoding_rs = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

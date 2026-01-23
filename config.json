@@ -1,0 +1,34 @@
+{
+  "targets": [
+    { "name": "Cloudflare", "address": "1.1.1.1:80" },
+    { "name": "Google DNS", "address": "8.8.8.8:53" },
+    { "name": "Local Router", "address": "192.168.0.1:80" }
+  ],
+  "commands": [
+    {
+      "name": "1. Показати IP",
+      "cmd": "ipconfig",
+      "args": ["/all"]
+    },
+    {
+      "name": "2. Очистити DNS",
+      "cmd": "ipconfig",
+      "args": ["/flushdns"]
+    },
+    {
+      "name": "3. Ping Santa (SITEL)",
+      "cmd": "ping",
+      "args": ["91.142.174.34", "-n", "1"]
+    },
+    {
+      "name": "4. Топ процесів",
+      "cmd": "powershell",
+      "args": ["-c", "ps | sort -d cpu | select -l 5"]
+    },
+    {
+      "name": "5. Версія Windows",
+      "cmd": "cmd",
+      "args": ["/C", "ver"]
+    }
+  ]
+}
