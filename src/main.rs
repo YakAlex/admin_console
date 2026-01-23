@@ -41,7 +41,7 @@ enum ActiveTab {
 }
 
 fn main() -> Result<()> {
-    // --- ІНІЦІАЛІЗАЦІЯ ---
+    // --- 1. ІНІЦІАЛІЗАЦІЯ ---
     let notes_path = "notes.txt";
     let notes_content = fs::read_to_string(notes_path).unwrap_or_default();
     let mut textarea = TextArea::new(notes_content.lines().map(|s| s.to_string()).collect());
@@ -103,8 +103,6 @@ fn main() -> Result<()> {
     let mut should_redraw = true;
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
-
-    // <--- НОВА ЗМІННА: Прапорець, чи ми зараз виділяємо текст
     let mut is_selecting = false;
 
     loop {
@@ -118,7 +116,7 @@ fn main() -> Result<()> {
             last_tick = Instant::now();
         }
 
-        // 2. МАЛЮВАННЯ
+        // 2. МАЛЮВАННЯ (Тут ми нічого не змінюємо, тільки читаємо!)
         if should_redraw {
             let global_cpu_usage = sys.global_cpu_info().cpu_usage();
             let used_mem = sys.used_memory();
@@ -174,6 +172,7 @@ fn main() -> Result<()> {
 
                 match active_tab {
                     ActiveTab::Notes => {
+                        // ПРИБРАНО set_line_width, який викликав помилку
                         f.render_widget(textarea.widget(), right_chunks[1]);
                     }
                     ActiveTab::Actions => {
@@ -216,9 +215,19 @@ fn main() -> Result<()> {
 
                         // === КЕРУВАННЯ НОТАТКАМИ ===
                         _ if active_tab == ActiveTab::Notes => {
-                            // 1. ВИДІЛЕННЯ (Ctrl + Shift + Arrows)
-                            if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) && key.code == KeyCode::Left {
-                                // Якщо ми ще не виділяли, ставимо "якір"
+
+                            // 1. CTRL + A (ВИДІЛИТИ ВСЕ)
+                            if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('ф')) {
+                                textarea.move_cursor(CursorMove::Top);
+                                textarea.move_cursor(CursorMove::Head);
+                                textarea.start_selection();
+                                textarea.move_cursor(CursorMove::Bottom);
+                                textarea.move_cursor(CursorMove::End);
+                                is_selecting = true;
+                            }
+
+                            // 2. ВИДІЛЕННЯ ПО СЛОВАХ (Ctrl + Shift + Arrows)
+                            else if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) && key.code == KeyCode::Left {
                                 if !is_selecting {
                                     textarea.start_selection();
                                     is_selecting = true;
@@ -232,33 +241,30 @@ fn main() -> Result<()> {
                                 }
                                 textarea.move_cursor(CursorMove::WordForward);
                             }
-                            // 2. РУХ БЕЗ ВИДІЛЕННЯ (Ctrl + Arrows)
+
+                            // 3. РУХ ПО СЛОВАХ БЕЗ ВИДІЛЕННЯ (Ctrl + Arrows)
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Left {
                                 textarea.cancel_selection();
-                                is_selecting = false; // Скидаємо прапорець
+                                is_selecting = false;
                                 textarea.move_cursor(CursorMove::WordBack);
                             }
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Right {
                                 textarea.cancel_selection();
-                                is_selecting = false; // Скидаємо прапорець
+                                is_selecting = false;
                                 textarea.move_cursor(CursorMove::WordForward);
                             }
+                            // Ctrl + Backspace
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Backspace {
                                 textarea.delete_word();
                                 is_selecting = false;
                             }
-                            // 3. ЗВИЧАЙНИЙ ВВІД
+                            // 4. ЗВИЧАЙНИЙ ВВІД
                             else {
                                 match key.code {
                                     KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace |
                                     KeyCode::Delete | KeyCode::Tab |
                                     KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
-                                        // При будь-якому вводі або простому русі виділення скидається
                                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                                            // Якщо просто стрілки або Shift+Буква - це введення/навігація, скидаємо "режим виділення слів"
-                                            // Хоча tui-textarea сама тримає виділення при Shift+Arrows (посимвольно),
-                                            // наш прапорець is_selecting для слів треба скинути, якщо ми клікаємо щось інше.
-                                            // Але tui-textarea сама скидає виділення при move_cursor без start_selection.
                                             is_selecting = false;
                                         }
                                         textarea.input(key);
