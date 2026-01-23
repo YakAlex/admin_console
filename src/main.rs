@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,6 +14,7 @@ use tui_textarea::{TextArea, CursorMove};
 use sysinfo::{System, Networks};
 use encoding_rs::IBM866;
 use serde::Deserialize;
+use arboard::Clipboard;
 
 #[derive(Clone, Deserialize)]
 struct Target {
@@ -44,7 +45,9 @@ fn main() -> Result<()> {
     // --- 1. ІНІЦІАЛІЗАЦІЯ ---
     let notes_path = "notes.txt";
     let notes_content = fs::read_to_string(notes_path).unwrap_or_default();
+
     let mut textarea = TextArea::new(notes_content.lines().map(|s| s.to_string()).collect());
+    textarea.set_max_histories(10000);
     textarea.set_block(Block::default().borders(Borders::ALL).title(""));
 
     let config_path = "config.json";
@@ -54,7 +57,7 @@ fn main() -> Result<()> {
 
     let config: AppConfig = serde_json::from_str(&config_data).unwrap_or(AppConfig { targets: vec![], commands: vec![] });
 
-    let targets = config.targets.clone();
+    let targets_for_thread = config.targets.clone();
     let commands = config.commands.clone();
 
     let mut list_state = ListState::default();
@@ -65,6 +68,8 @@ fn main() -> Result<()> {
     let mut active_tab = ActiveTab::Notes;
     let (tx, rx) = mpsc::channel();
 
+    let mut clipboard = Clipboard::new().ok();
+
     // Фоновий потік (Мережа)
     thread::spawn(move || {
         loop {
@@ -72,7 +77,7 @@ fn main() -> Result<()> {
             report.push_str("   TARGET       | STATUS | PING \n");
             report.push_str("----------------+--------+------\n");
 
-            for target in &targets {
+            for target in &targets_for_thread {
                 let start = Instant::now();
                 match TcpStream::connect_timeout(&target.address.parse().unwrap_or("0.0.0.0:0".parse().unwrap()), Duration::from_millis(1000)) {
                     Ok(_) => {
@@ -93,20 +98,22 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Вмикаємо Bracketed Paste для правильної вставки
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut monitor_output = "Scanning network...".to_string();
 
-    // Змінні для оптимізації та логіки
     let mut should_redraw = true;
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
     let mut is_selecting = false;
 
+    // <--- НОВА ЗМІННА ДЛЯ АВТОЗБЕРЕЖЕННЯ
+    let mut notes_modified = false;
+
     loop {
-        // 1. ЛОГІКА ТАЙМЕРА
         if last_tick.elapsed() >= tick_rate {
             sys.refresh_all();
             if let Ok(new_report) = rx.try_recv() {
@@ -116,7 +123,6 @@ fn main() -> Result<()> {
             last_tick = Instant::now();
         }
 
-        // 2. МАЛЮВАННЯ (Тут ми нічого не змінюємо, тільки читаємо!)
         if should_redraw {
             let global_cpu_usage = sys.global_cpu_info().cpu_usage();
             let used_mem = sys.used_memory();
@@ -172,7 +178,6 @@ fn main() -> Result<()> {
 
                 match active_tab {
                     ActiveTab::Notes => {
-                        // ПРИБРАНО set_line_width, який викликав помилку
                         f.render_widget(textarea.widget(), right_chunks[1]);
                     }
                     ActiveTab::Actions => {
@@ -194,13 +199,18 @@ fn main() -> Result<()> {
             should_redraw = false;
         }
 
-        // 3. ОБРОБКА ПОДІЙ
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
 
         if event::poll(timeout)? {
             let evt = event::read()?;
 
             match evt {
+                Event::Paste(data) if active_tab == ActiveTab::Notes => {
+                    should_redraw = true;
+                    textarea.insert_str(data);
+                    notes_modified = true; // <--- Текст змінився (Вставка)
+                }
+
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     should_redraw = true;
 
@@ -216,8 +226,47 @@ fn main() -> Result<()> {
                         // === КЕРУВАННЯ НОТАТКАМИ ===
                         _ if active_tab == ActiveTab::Notes => {
 
-                            // 1. CTRL + A (ВИДІЛИТИ ВСЕ)
-                            if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('ф')) {
+                            // 1. КОПІЮВАННЯ / ВСТАВКА
+                            if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('с')) {
+                                textarea.copy();
+                                let text = textarea.yank_text();
+                                if !text.is_empty() {
+                                    if let Some(cb) = &mut clipboard {
+                                        let _ = cb.set_text(text);
+                                    }
+                                }
+                            }
+                            // Paste (Ctrl+V або Alt+V)
+                            else if (key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('v') || key.code == KeyCode::Char('м'))) ||
+                                (key.modifiers == KeyModifiers::ALT && (key.code == KeyCode::Char('v') || key.code == KeyCode::Char('м'))) {
+                                if let Some(cb) = &mut clipboard {
+                                    if let Ok(text) = cb.get_text() {
+                                        textarea.insert_str(text);
+                                        notes_modified = true; // <--- Текст змінився (Вставка з буфера)
+                                    }
+                                }
+                            }
+                            // Cut (Ctrl+X)
+                            else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('x') || key.code == KeyCode::Char('ч')) {
+                                textarea.cut();
+                                let text = textarea.yank_text();
+                                if let Some(cb) = &mut clipboard {
+                                    let _ = cb.set_text(text);
+                                }
+                                notes_modified = true; // <--- Текст змінився (Вирізання)
+                            }
+                            // Undo (Ctrl+Z)
+                            else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('z') || key.code == KeyCode::Char('я')) {
+                                textarea.undo();
+                                notes_modified = true; // <--- Текст змінився (Undo)
+                            }
+                            // Redo (Ctrl+Y)
+                            else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('y') || key.code == KeyCode::Char('н')) {
+                                textarea.redo();
+                                notes_modified = true; // <--- Текст змінився (Redo)
+                            }
+                            // Select All (Ctrl+A)
+                            else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('ф')) {
                                 textarea.move_cursor(CursorMove::Top);
                                 textarea.move_cursor(CursorMove::Head);
                                 textarea.start_selection();
@@ -226,23 +275,15 @@ fn main() -> Result<()> {
                                 is_selecting = true;
                             }
 
-                            // 2. ВИДІЛЕННЯ ПО СЛОВАХ (Ctrl + Shift + Arrows)
+                            // 2. НАВІГАЦІЯ
                             else if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) && key.code == KeyCode::Left {
-                                if !is_selecting {
-                                    textarea.start_selection();
-                                    is_selecting = true;
-                                }
+                                if !is_selecting { textarea.start_selection(); is_selecting = true; }
                                 textarea.move_cursor(CursorMove::WordBack);
                             }
                             else if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) && key.code == KeyCode::Right {
-                                if !is_selecting {
-                                    textarea.start_selection();
-                                    is_selecting = true;
-                                }
+                                if !is_selecting { textarea.start_selection(); is_selecting = true; }
                                 textarea.move_cursor(CursorMove::WordForward);
                             }
-
-                            // 3. РУХ ПО СЛОВАХ БЕЗ ВИДІЛЕННЯ (Ctrl + Arrows)
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Left {
                                 textarea.cancel_selection();
                                 is_selecting = false;
@@ -253,22 +294,29 @@ fn main() -> Result<()> {
                                 is_selecting = false;
                                 textarea.move_cursor(CursorMove::WordForward);
                             }
-                            // Ctrl + Backspace
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Backspace {
                                 textarea.delete_word();
                                 is_selecting = false;
+                                notes_modified = true; // <--- Текст змінився (Видалення слова)
                             }
-                            // 4. ЗВИЧАЙНИЙ ВВІД
+                            // 3. ЗВИЧАЙНИЙ ВВІД
                             else {
                                 match key.code {
                                     KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace |
-                                    KeyCode::Delete | KeyCode::Tab |
+                                    KeyCode::Delete | KeyCode::Tab => {
+                                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                                            is_selecting = false;
+                                        }
+                                        textarea.input(key);
+                                        notes_modified = true; // <--- Текст змінився (Друк)
+                                    },
+                                    // Навігацію не вважаємо зміною
                                     KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                                             is_selecting = false;
                                         }
                                         textarea.input(key);
-                                    },
+                                    }
                                     _ => {}
                                 }
                             }
@@ -298,6 +346,8 @@ fn main() -> Result<()> {
                                 if i < commands.len() {
                                     let cmd_struct = &commands[i];
                                     textarea.insert_str(format!("\n--- Executing: {} ---\n", cmd_struct.name));
+                                    // Тут теж текст змінюється, зберігаємо
+                                    notes_modified = true;
 
                                     let output = Command::new(&cmd_struct.cmd)
                                         .args(&cmd_struct.args)
@@ -328,13 +378,23 @@ fn main() -> Result<()> {
                 _ => {}
             }
         }
+
+        // --- АВТОЗБЕРЕЖЕННЯ ---
+        // Якщо текст змінився, зберігаємо файл негайно
+        if notes_modified {
+            let text_to_save = textarea.lines().join("\n");
+            // Використовуємо .ok(), щоб не панікувати, якщо файл зайнятий (спробуємо наступного разу)
+            fs::write(notes_path, text_to_save).ok();
+            notes_modified = false;
+        }
     }
 
+    // Фінальне збереження при виході (про всяк випадок)
     let text_to_save = textarea.lines().join("\n");
     fs::write(notes_path, text_to_save)?;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
     Ok(())
