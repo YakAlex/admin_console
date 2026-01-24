@@ -1,3 +1,8 @@
+// Підключаємо наші нові модулі
+mod config;
+mod types;
+mod utils;
+
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -6,69 +11,22 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, Gauge, List, ListItem, ListState, Tabs, Table, Row, Cell},
+    widgets::{Block, Borders, Paragraph, Gauge, List, ListItem, ListState, Tabs, Table, Row, Cell, Clear},
     style::{Color, Modifier, Style},
 };
 use std::{fs, io, net::TcpStream, process::Command, sync::mpsc, thread, time::{Duration, Instant}, collections::VecDeque};
 use tui_textarea::{TextArea, CursorMove};
-use sysinfo::System; // Прибрали зайвий Networks
+use sysinfo::System;
 use encoding_rs::IBM866;
-use serde::Deserialize;
 use arboard::Clipboard;
 
-#[derive(Clone, Deserialize)]
-struct Target {
-    name: String,
-    address: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct AdminCommand {
-    name: String,
-    cmd: String,
-    args: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct AppConfig {
-    targets: Vec<Target>,
-    commands: Vec<AdminCommand>,
-}
-
-#[derive(Clone)]
-struct ServerStatus {
-    name: String,
-    is_online: bool,
-    latency: u128,
-    history: VecDeque<u128>,
-}
-
-#[derive(PartialEq, Copy, Clone)]
-enum EditorMode {
-    Notes = 0,
-    Todo = 1,
-    Logs = 2,
-}
-
-#[derive(PartialEq)]
-enum ActiveView {
-    Editor(EditorMode),
-    Actions,
-}
-
-fn generate_sparkline(history: &VecDeque<u128>) -> String {
-    history.iter().map(|&val| {
-        if val == 0 { " " }
-        else if val < 20 { " " }
-        else if val < 50 { "▂" }
-        else if val < 100 { "▃" }
-        else if val < 200 { "▅" }
-        else { "▇" }
-    }).collect()
-}
+// Використовуємо типи з наших нових файлів
+use crate::config::AppConfig;
+use crate::types::{ServerStatus, AppEvent, EditorMode, ActiveView};
+use crate::utils::{generate_sparkline, centered_rect};
 
 fn main() -> Result<()> {
-    // --- 1. ІНІЦІАЛІЗАЦІЯ ФАЙЛІВ ---
+    // --- ІНІЦІАЛІЗАЦІЯ ---
     let file_names = vec!["notes.txt", "todo.txt", "logs.txt"];
     let titles = vec![" 1.Notes ", " 2.Todo ", " 3.Logs "];
 
@@ -78,10 +36,10 @@ fn main() -> Result<()> {
         let mut ta = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         ta.set_max_histories(10000);
         ta.set_block(Block::default().borders(Borders::ALL));
+        ta.set_search_style(Style::default().bg(Color::Yellow).fg(Color::Black));
         textareas.push(ta);
     }
 
-    // --- КОНФІГУРАЦІЯ ---
     let config_path = "config.json";
     let config_data = fs::read_to_string(config_path).unwrap_or_else(|_| {
         r#"{ "targets": [], "commands": [] }"#.to_string()
@@ -98,8 +56,10 @@ fn main() -> Result<()> {
     }
 
     let mut active_view = ActiveView::Editor(EditorMode::Notes);
-    let (tx, rx) = mpsc::channel::<Vec<ServerStatus>>();
+    let (tx, rx) = mpsc::channel::<AppEvent>();
     let mut clipboard = Clipboard::new().ok();
+
+    let tx_monitor = tx.clone();
 
     // --- ФОНОВИЙ ПОТІК (МОНІТОРИНГ) ---
     thread::spawn(move || {
@@ -113,34 +73,25 @@ fn main() -> Result<()> {
         loop {
             for (i, target) in targets_for_thread.iter().enumerate() {
                 let start = Instant::now();
-                match TcpStream::connect_timeout(&target.address.parse().unwrap_or("0.0.0.0:0".parse().unwrap()), Duration::from_millis(500)) {
-                    Ok(_) => {
-                        let duration = start.elapsed().as_millis();
-                        statuses[i].is_online = true;
-                        statuses[i].latency = duration;
-                    },
-                    Err(_) => {
-                        statuses[i].is_online = false;
-                        statuses[i].latency = 0;
-                    }
-                }
+                let (online, lat) = match TcpStream::connect_timeout(&target.address.parse().unwrap_or("0.0.0.0:0".parse().unwrap()), Duration::from_millis(500)) {
+                    Ok(_) => (true, start.elapsed().as_millis()),
+                    Err(_) => (false, 0),
+                };
 
-                // --- ВИПРАВЛЕННЯ ПОМИЛКИ ---
-                // Спочатку обчислюємо значення, щоб не читати структуру під час запису
-                let history_val = if statuses[i].is_online { statuses[i].latency } else { 999 };
+                let status = &mut statuses[i];
+                status.is_online = online;
+                status.latency = lat;
 
-                // Тепер безпечно записуємо
-                statuses[i].history.pop_front();
-                statuses[i].history.push_back(history_val);
+                let history_val = if status.is_online { status.latency } else { 999 };
+                status.history.pop_front();
+                status.history.push_back(history_val);
             }
-
-            let _ = tx.send(statuses.clone());
+            let _ = tx_monitor.send(AppEvent::ServerUpdate(statuses.clone()));
             thread::sleep(Duration::from_secs(1));
         }
     });
 
     let mut sys = System::new_all();
-
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -149,17 +100,30 @@ fn main() -> Result<()> {
 
     let mut server_data: Vec<ServerStatus> = Vec::new();
     let mut should_redraw = true;
-    let tick_rate = Duration::from_millis(250);
+    let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
     let mut is_selecting = false;
     let mut files_modified = vec![false, false, false];
 
     loop {
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::ServerUpdate(data) => {
+                    server_data = data;
+                    should_redraw = true;
+                }
+                AppEvent::LogOutput(text) => {
+                    let log_textarea = &mut textareas[2];
+                    log_textarea.insert_str(text);
+                    log_textarea.insert_str("\n--------------------------\n");
+                    files_modified[2] = true;
+                    should_redraw = true;
+                }
+            }
+        }
+
         if last_tick.elapsed() >= tick_rate {
             sys.refresh_all();
-            if let Ok(new_data) = rx.try_recv() {
-                server_data = new_data;
-            }
             should_redraw = true;
             last_tick = Instant::now();
         }
@@ -171,18 +135,21 @@ fn main() -> Result<()> {
             let mem_percentage = if total_mem > 0 { (used_mem as f64 / total_mem as f64) * 100.0 } else { 0.0 };
 
             terminal.draw(|f| {
-                // ВИПРАВЛЕННЯ: f.size() -> f.area()
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
                     .split(f.area());
 
+                // ✅ НОВИЙ ВАРІАНТ (Адаптивний)
                 let left_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                    .constraints([
+                        Constraint::Min(10),  // Таблиця серверів забирає ВСЕ вільне місце (мінімум 10 рядків)
+                        Constraint::Length(6) // Нижня панель (System) завжди фіксована — 6 рядків
+                    ])
                     .split(main_chunks[0]);
 
-                // --- ТАБЛИЦЯ ---
+                // --- TABLE ---
                 let header_cells = ["Server", "Ping", "Status", "History"]
                     .iter()
                     .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
@@ -213,40 +180,31 @@ fn main() -> Result<()> {
                 ])
                     .header(header)
                     .block(Block::default().borders(Borders::ALL).title(" 📡 Servers "));
-
                 f.render_widget(table, left_chunks[0]);
 
                 // --- SYSTEM ---
                 let sys_block = Block::default().title(" 💻 System ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow));
                 f.render_widget(sys_block, left_chunks[1]);
-
                 let sys_area = left_chunks[1].inner(Margin { vertical: 1, horizontal: 1 });
                 let gauge_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(2), Constraint::Length(1), Constraint::Length(2)])
                     .split(sys_area);
 
-                let cpu_gauge = Gauge::default()
-                    .gauge_style(Style::default().fg(Color::Green))
-                    .ratio((global_cpu_usage as f64 / 100.0).clamp(0.0, 1.0))
-                    .label(format!("CPU: {:.1}%", global_cpu_usage));
-                f.render_widget(cpu_gauge, gauge_chunks[0]);
-
-                let mem_gauge = Gauge::default()
-                    .gauge_style(Style::default().fg(Color::Magenta))
-                    .ratio((mem_percentage / 100.0).clamp(0.0, 1.0))
-                    .label(format!("RAM: {:.1}%", mem_percentage));
-                f.render_widget(mem_gauge, gauge_chunks[2]);
+                f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Green)).ratio((global_cpu_usage as f64 / 100.0).clamp(0.0, 1.0)).label(format!("CPU: {:.1}%", global_cpu_usage)), gauge_chunks[0]);
+                f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Magenta)).ratio((mem_percentage / 100.0).clamp(0.0, 1.0)).label(format!("RAM: {:.1}%", mem_percentage)), gauge_chunks[2]);
 
                 let right_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(3), Constraint::Min(0)])
                     .split(main_chunks[1]);
 
-                // --- TABS & EDITOR ---
+                // --- TABS ---
                 let (current_file_idx, is_actions_active) = match active_view {
                     ActiveView::Editor(mode) => (mode as usize, false),
+                    ActiveView::Search { mode_return_to, .. } => (mode_return_to as usize, false),
                     ActiveView::Actions => (0, true),
+                    ActiveView::InputPopup { .. } => (0, true),
                 };
 
                 let file_tabs = Tabs::new(titles.clone())
@@ -268,13 +226,13 @@ fn main() -> Result<()> {
                 };
                 f.render_widget(action_status, header_chunks[1]);
 
-                match active_view {
-                    ActiveView::Editor(mode) => {
-                        let idx = mode as usize;
-                        // ВИПРАВЛЕННЯ: передаємо посилання &textareas[idx] напряму
+                // --- MAIN CONTENT ---
+                match &active_view {
+                    ActiveView::Editor(mode) | ActiveView::Search { mode_return_to: mode, .. } => {
+                        let idx = *mode as usize;
                         f.render_widget(&textareas[idx], right_chunks[1]);
                     }
-                    ActiveView::Actions => {
+                    ActiveView::Actions | ActiveView::InputPopup { .. } => {
                         let items: Vec<ListItem> = commands
                             .iter()
                             .map(|i| ListItem::new(i.name.clone()).style(Style::default().fg(Color::White)))
@@ -287,6 +245,34 @@ fn main() -> Result<()> {
 
                         f.render_stateful_widget(list, right_chunks[1], &mut list_state);
                     }
+                }
+
+                // --- SEARCH BAR ---
+                if let ActiveView::Search { query, .. } = &active_view {
+                    let area = right_chunks[1];
+                    let search_area = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(0), Constraint::Length(3)])
+                        .split(area)[1];
+
+                    let search_block = Paragraph::new(format!("Search: {}", query))
+                        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
+                        .style(Style::default().fg(Color::Yellow).bg(Color::Black));
+
+                    f.render_widget(Clear, search_area);
+                    f.render_widget(search_block, search_area);
+                }
+
+                // --- POPUP ---
+                if let ActiveView::InputPopup { input_buffer, .. } = &active_view {
+                    let area = centered_rect(60, 20, f.area());
+                    f.render_widget(Clear, area);
+
+                    let popup_block = Paragraph::new(input_buffer.clone())
+                        .block(Block::default().borders(Borders::ALL).title(" Введіть аргумент (IP/Host) "))
+                        .style(Style::default().fg(Color::Yellow).bg(Color::Black));
+
+                    f.render_widget(popup_block, area);
                 }
             })?;
 
@@ -310,45 +296,104 @@ fn main() -> Result<()> {
 
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     should_redraw = true;
+                    let mut change_view = None;
 
-                    match key.code {
-                        KeyCode::Esc => break,
+                    if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('й')) {
+                        break;
+                    }
 
-                        KeyCode::Tab => {
-                            active_view = match active_view {
-                                ActiveView::Editor(_) => ActiveView::Actions,
-                                ActiveView::Actions => ActiveView::Editor(EditorMode::Notes),
-                            };
+                    match &mut active_view {
+                        // === РЕЖИМ ПОШУКУ ===
+                        ActiveView::Search { mode_return_to, query } => {
+                            let idx = *mode_return_to as usize;
+                            match key.code {
+                                KeyCode::Esc => {
+                                    textareas[idx].set_search_pattern("").ok();
+                                    change_view = Some(ActiveView::Editor(*mode_return_to));
+                                }
+                                KeyCode::Enter => {
+                                    textareas[idx].search_forward(false);
+                                }
+                                KeyCode::Backspace => {
+                                    query.pop();
+                                    textareas[idx].set_search_pattern(query.as_str()).ok();
+                                }
+                                KeyCode::Char(c) => {
+                                    query.push(c);
+                                    textareas[idx].set_search_pattern(query.as_str()).ok();
+                                    textareas[idx].search_forward(false);
+                                }
+                                _ => {}
+                            }
                         }
 
-                        KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
-                            active_view = ActiveView::Editor(EditorMode::Notes);
-                        }
-                        KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
-                            active_view = ActiveView::Editor(EditorMode::Todo);
-                        }
-                        KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
-                            active_view = ActiveView::Editor(EditorMode::Logs);
+                        // === РЕЖИМ POPUP ВВОДУ ===
+                        ActiveView::InputPopup { command_idx, input_buffer } => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    let idx_copy = *command_idx;
+                                    if idx_copy < commands.len() {
+                                        let cmd_struct = commands[idx_copy].clone();
+                                        let buffer_clone = input_buffer.clone();
+
+                                        let final_args: Vec<String> = cmd_struct.args.iter()
+                                            .map(|arg| if arg == "%INPUT%" { buffer_clone.clone() } else { arg.clone() })
+                                            .collect();
+
+                                        change_view = Some(ActiveView::Editor(EditorMode::Logs));
+                                        let log_textarea = &mut textareas[2];
+                                        log_textarea.insert_str(format!("\n--- Executing (Async): {} ({}) ---\n", cmd_struct.name, buffer_clone));
+                                        files_modified[2] = true;
+
+                                        let tx_cmd = tx.clone();
+                                        let cmd_exe = cmd_struct.cmd.clone();
+
+                                        thread::spawn(move || {
+                                            let output = Command::new(cmd_exe).args(final_args).output();
+                                            let mut result_text = String::new();
+                                            match output {
+                                                Ok(o) => {
+                                                    let (decoded_str, _, _) = IBM866.decode(&o.stdout);
+                                                    result_text.push_str(&decoded_str);
+                                                    if !o.stderr.is_empty() {
+                                                        let (err_str, _, _) = IBM866.decode(&o.stderr);
+                                                        result_text.push_str("\nERROR:\n");
+                                                        result_text.push_str(&err_str);
+                                                    }
+                                                },
+                                                Err(e) => { result_text.push_str(&format!("Failed to run: {}", e)); }
+                                            }
+                                            let _ = tx_cmd.send(AppEvent::LogOutput(result_text));
+                                        });
+                                    }
+                                }
+                                KeyCode::Esc => { change_view = Some(ActiveView::Actions); }
+                                KeyCode::Backspace => { input_buffer.pop(); }
+                                KeyCode::Char(c) => { input_buffer.push(c); }
+                                _ => {}
+                            }
                         }
 
-                        _ => if let ActiveView::Editor(mode) = active_view {
-                            let idx = mode as usize;
+                        // === РЕЖИМ РЕДАКТОРА ===
+                        ActiveView::Editor(mode) => {
+                            let idx = *mode as usize;
                             let textarea = &mut textareas[idx];
 
-                            if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('с')) {
+                            if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('f') || key.code == KeyCode::Char('а')) {
+                                change_view = Some(ActiveView::Search {
+                                    mode_return_to: *mode,
+                                    query: String::new()
+                                });
+                            }
+                            else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('с')) {
                                 textarea.copy();
                                 let text = textarea.yank_text();
-                                if !text.is_empty() {
-                                    if let Some(cb) = &mut clipboard { let _ = cb.set_text(text); }
-                                }
+                                if !text.is_empty() { if let Some(cb) = &mut clipboard { let _ = cb.set_text(text); } }
                             }
                             else if (key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('v') || key.code == KeyCode::Char('м'))) ||
                                 (key.modifiers == KeyModifiers::ALT && (key.code == KeyCode::Char('v') || key.code == KeyCode::Char('м'))) {
                                 if let Some(cb) = &mut clipboard {
-                                    if let Ok(text) = cb.get_text() {
-                                        textarea.insert_str(text);
-                                        files_modified[idx] = true;
-                                    }
+                                    if let Ok(text) = cb.get_text() { textarea.insert_str(text); files_modified[idx] = true; }
                                 }
                             }
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('x') || key.code == KeyCode::Char('ч')) {
@@ -358,12 +403,10 @@ fn main() -> Result<()> {
                                 files_modified[idx] = true;
                             }
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('z') || key.code == KeyCode::Char('я')) {
-                                textarea.undo();
-                                files_modified[idx] = true;
+                                textarea.undo(); files_modified[idx] = true;
                             }
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('y') || key.code == KeyCode::Char('н')) {
-                                textarea.redo();
-                                files_modified[idx] = true;
+                                textarea.redo(); files_modified[idx] = true;
                             }
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('ф')) {
                                 textarea.move_cursor(CursorMove::Top);
@@ -390,16 +433,27 @@ fn main() -> Result<()> {
                                 textarea.move_cursor(CursorMove::WordForward);
                             }
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Backspace {
-                                textarea.delete_word(); is_selecting = false;
-                                files_modified[idx] = true;
+                                textarea.delete_word(); is_selecting = false; files_modified[idx] = true;
                             }
                             else {
                                 match key.code {
+                                    KeyCode::Esc => break,
+                                    KeyCode::Tab => {
+                                        change_view = Some(ActiveView::Actions);
+                                    }
+                                    KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
+                                        change_view = Some(ActiveView::Editor(EditorMode::Notes));
+                                    }
+                                    KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
+                                        change_view = Some(ActiveView::Editor(EditorMode::Todo));
+                                    }
+                                    KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
+                                        change_view = Some(ActiveView::Editor(EditorMode::Logs));
+                                    }
                                     KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace |
-                                    KeyCode::Delete | KeyCode::Tab => {
+                                    KeyCode::Delete => {
                                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT { is_selecting = false; }
-                                        textarea.input(key);
-                                        files_modified[idx] = true;
+                                        textarea.input(key); files_modified[idx] = true;
                                     },
                                     KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT { is_selecting = false; }
@@ -409,9 +463,16 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-                        // === РЕЖИМ КОМАНД ===
-                        else if let ActiveView::Actions = active_view {
+
+                        // === РЕЖИМ МЕНЮ ДІЙ ===
+                        ActiveView::Actions => {
                             match key.code {
+                                KeyCode::Esc => {
+                                    change_view = Some(ActiveView::Editor(EditorMode::Notes));
+                                }
+                                KeyCode::Tab => {
+                                    change_view = Some(ActiveView::Editor(EditorMode::Notes));
+                                }
                                 KeyCode::Down => {
                                     if !commands.is_empty() {
                                         let i = match list_state.selected() {
@@ -433,39 +494,51 @@ fn main() -> Result<()> {
                                 KeyCode::Enter => {
                                     if let Some(i) = list_state.selected() {
                                         if i < commands.len() {
-                                            let cmd_struct = &commands[i];
+                                            let cmd_struct = commands[i].clone();
 
-                                            let output = Command::new(&cmd_struct.cmd)
-                                                .args(&cmd_struct.args)
-                                                .output();
+                                            if cmd_struct.args.contains(&"%INPUT%".to_string()) {
+                                                change_view = Some(ActiveView::InputPopup {
+                                                    command_idx: i,
+                                                    input_buffer: String::new()
+                                                });
+                                            } else {
+                                                change_view = Some(ActiveView::Editor(EditorMode::Logs));
+                                                let log_textarea = &mut textareas[2];
+                                                log_textarea.insert_str(format!("\n--- Executing (Async): {} ---\n", cmd_struct.name));
+                                                files_modified[2] = true;
 
-                                            active_view = ActiveView::Editor(EditorMode::Logs);
-                                            let log_textarea = &mut textareas[2];
-                                            files_modified[2] = true;
+                                                let tx_cmd = tx.clone();
+                                                let cmd_exe = cmd_struct.cmd.clone();
+                                                let cmd_args = cmd_struct.args.clone();
 
-                                            log_textarea.insert_str(format!("\n--- Executing: {} ---\n", cmd_struct.name));
-
-                                            match output {
-                                                Ok(o) => {
-                                                    let (decoded_str, _, _) = IBM866.decode(&o.stdout);
-                                                    log_textarea.insert_str(decoded_str);
-                                                    if !o.stderr.is_empty() {
-                                                        let (err_str, _, _) = IBM866.decode(&o.stderr);
-                                                        log_textarea.insert_str("\nERROR:\n");
-                                                        log_textarea.insert_str(err_str);
+                                                thread::spawn(move || {
+                                                    let output = Command::new(cmd_exe).args(cmd_args).output();
+                                                    let mut result_text = String::new();
+                                                    match output {
+                                                        Ok(o) => {
+                                                            let (decoded_str, _, _) = IBM866.decode(&o.stdout);
+                                                            result_text.push_str(&decoded_str);
+                                                            if !o.stderr.is_empty() {
+                                                                let (err_str, _, _) = IBM866.decode(&o.stderr);
+                                                                result_text.push_str("\nERROR:\n");
+                                                                result_text.push_str(&err_str);
+                                                            }
+                                                        },
+                                                        Err(e) => { result_text.push_str(&format!("Failed to run: {}", e)); }
                                                     }
-                                                },
-                                                Err(e) => {
-                                                    log_textarea.insert_str(format!("Failed to run: {}", e));
-                                                }
+                                                    let _ = tx_cmd.send(AppEvent::LogOutput(result_text));
+                                                });
                                             }
-                                            log_textarea.insert_str("\n--------------------------\n");
                                         }
                                     }
                                 }
                                 _ => {}
                             }
                         }
+                    }
+
+                    if let Some(new_view) = change_view {
+                        active_view = new_view;
                     }
                 }
                 _ => {}

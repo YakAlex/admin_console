@@ -11,6 +11,7 @@
 ],
 "commands": [
 { "name": "Ping Google", "cmd": "ping", "args": ["8.8.8.8"] },
+{ "name": "Ping Custom IP", "cmd": "ping", "args": ["%INPUT%"] },
 { "name": "IP Config", "cmd": "ipconfig", "args": ["/all"] },
 { "name": "Check Disk", "cmd": "chkntfs", "args": ["C:"] }
 ]
