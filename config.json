@@ -1,34 +1,17 @@
 {
-  "targets": [
-    { "name": "Cloudflare", "address": "1.1.1.1:80" },
-    { "name": "Google DNS", "address": "8.8.8.8:53" },
-    { "name": "Local Router", "address": "192.168.0.1:80" }
-  ],
-  "commands": [
-    {
-      "name": "1. Показати IP",
-      "cmd": "ipconfig",
-      "args": ["/all"]
-    },
-    {
-      "name": "2. Очистити DNS",
-      "cmd": "ipconfig",
-      "args": ["/flushdns"]
-    },
-    {
-      "name": "3. Ping Santa (SITEL)",
-      "cmd": "ping",
-      "args": ["91.142.174.34", "-n", "1"]
-    },
-    {
-      "name": "4. Топ процесів",
-      "cmd": "powershell",
-      "args": ["-c", "ps | sort -d cpu | select -l 5"]
-    },
-    {
-      "name": "5. Версія Windows",
-      "cmd": "cmd",
-      "args": ["/C", "ver"]
-    }
-  ]
+"targets": [
+{ "name": "Google DNS", "address": "8.8.8.8:53" },
+{ "name": "Cloudflare", "address": "1.1.1.1:53" },
+{ "name": "OpenDNS", "address": "208.67.222.222:53" },
+{ "name": "Quad9", "address": "9.9.9.9:53" },
+{ "name": "Level3", "address": "4.2.2.1:53" },
+{ "name": "Bad IP", "address": "192.168.255.255:80" },
+{ "name": "Punkt Nez", "address": "91.142.174.34:80" },
+{ "name": "Local Router", "address": "192.168.0.1:80" }
+],
+"commands": [
+{ "name": "Ping Google", "cmd": "ping", "args": ["8.8.8.8"] },
+{ "name": "IP Config", "cmd": "ipconfig", "args": ["/all"] },
+{ "name": "Check Disk", "cmd": "chkntfs", "args": ["C:"] }
+]
 }
