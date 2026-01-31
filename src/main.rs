@@ -22,8 +22,8 @@ use chrono::Local;
 use notify_rust::Notification;
 
 use crate::config::AppConfig;
-use crate::types::{ServerStatus, AppEvent, EditorMode, ActiveView};
-use crate::utils::centered_rect; // Прибрали generate_sparkline
+use crate::types::{ServerStatus, AppEvent, EditorMode, ActiveView, MonitorCommand, Task, WizardStep};
+use crate::utils::centered_rect;
 
 fn main() -> Result<()> {
     // --- ІНІЦІАЛІЗАЦІЯ ---
@@ -44,9 +44,16 @@ fn main() -> Result<()> {
     let config_data = fs::read_to_string(config_path).unwrap_or_else(|_| {
         r#"{ "targets": [], "commands": [] }"#.to_string()
     });
-
     let config: AppConfig = serde_json::from_str(&config_data).unwrap_or(AppConfig { targets: vec![], commands: vec![] });
 
+    // --- ЗАВАНТАЖЕННЯ ЗАВДАНЬ (JSON) ---
+    let tasks_path = "tasks.json";
+    let tasks_data = fs::read_to_string(tasks_path).unwrap_or_else(|_| "[]".to_string());
+    // Якщо файл порожній або битий, створюємо пустий список
+    let mut tasks: Vec<Task> = serde_json::from_str(&tasks_data).unwrap_or(Vec::new());
+
+    // Копії для передачі в потік
+    let tasks_for_thread = tasks.clone();
     let targets_for_thread = config.targets.clone();
     let commands = config.commands.clone();
 
@@ -58,11 +65,13 @@ fn main() -> Result<()> {
 
     let mut active_view = ActiveView::Editor(EditorMode::Notes);
     let (tx, rx) = mpsc::channel::<AppEvent>();
-    let mut clipboard = Clipboard::new().ok();
+    // Канал для комунікації з монітором
+    let (tx_to_monitor, rx_from_main) = mpsc::channel::<MonitorCommand>();
 
+    let mut clipboard = Clipboard::new().ok();
     let tx_monitor = tx.clone();
 
-    // --- ФОНОВИЙ ПОТІК ---
+    // --- ФОНОВИЙ ПОТІК (МОНІТОРИНГ + НАГАДУВАННЯ) ---
     thread::spawn(move || {
         let mut statuses: Vec<ServerStatus> = targets_for_thread.iter().map(|t| ServerStatus {
             name: t.name.clone(),
@@ -71,10 +80,28 @@ fn main() -> Result<()> {
             history: VecDeque::from(vec![0; 20]),
         }).collect();
 
-        let mut previous_online_status: Vec<bool> = vec![true; targets_for_thread.len()];
+        // Локальна копія завдань та змінна часу
+        let mut thread_tasks = tasks_for_thread;
+        let mut last_checked_minute = String::new();
+
+        let mut current_targets = targets_for_thread.clone();
+        let mut previous_online_status: Vec<bool> = vec![true; current_targets.len()];
 
         loop {
-            for (i, target) in targets_for_thread.iter().enumerate() {
+            // 1. Отримуємо оновлення від Main
+            while let Ok(cmd) = rx_from_main.try_recv() {
+                match cmd {
+                    MonitorCommand::UpdateTargets(new_targets) => {
+                        current_targets = new_targets;
+                    }
+                    MonitorCommand::UpdateTasks(new_tasks) => {
+                        thread_tasks = new_tasks; // Оновлюємо список завдань
+                    }
+                }
+            }
+
+            // 2. ПІНГ СЕРВЕРІВ
+            for (i, target) in current_targets.iter().enumerate() {
                 let start = Instant::now();
                 let (online, lat) = match TcpStream::connect_timeout(&target.address.parse().unwrap_or("0.0.0.0:0".parse().unwrap()), Duration::from_millis(500)) {
                     Ok(_) => (true, start.elapsed().as_millis()),
@@ -85,7 +112,6 @@ fn main() -> Result<()> {
                 status.is_online = online;
                 status.latency = lat;
 
-                // Логіка історії залишається для внутрішніх потреб, але не відображається
                 let history_val = if status.is_online { status.latency } else { 999 };
                 status.history.pop_front();
                 status.history.push_back(history_val);
@@ -93,20 +119,31 @@ fn main() -> Result<()> {
                 if previous_online_status[i] && !online {
                     let timestamp = Local::now().format("%H:%M:%S");
                     let log_msg = format!("[{}] 🔴 ALERT: Server '{}' went OFFLINE!", timestamp, target.name);
-                    // 1. Пишемо в лог (як і раніше)
                     let _ = tx_monitor.send(AppEvent::LogOutput(log_msg));
-
-                    // 2. ВІДПРАВЛЯЄМО WINDOWS-ПОВІДОМЛЕННЯ
-                    Notification::new()
-                        .summary("SERVER DOWN ⚠️")
-                        .body(&format!("Увага! Сервер '{}' перестав відповідати.", target.name))
-                        .appname("Admin Console")
-                        .show()
-                        .ok();
+                    Notification::new().summary("SERVER DOWN ⚠️").body(&format!("Увага! Сервер '{}' перестав відповідати.", target.name)).appname("Admin Console").show().ok();
                 }
                 previous_online_status[i] = online;
             }
             let _ = tx_monitor.send(AppEvent::ServerUpdate(statuses.clone()));
+
+            // 3. ПЕРЕВІРКА НАГАДУВАНЬ
+            let current_time_str = Local::now().format("%H:%M").to_string();
+
+            // Перевіряємо тільки якщо настала нова хвилина
+            if current_time_str != last_checked_minute {
+                for task in &thread_tasks {
+                    if !task.time.is_empty() && task.time == current_time_str {
+                        Notification::new()
+                            .summary(&format!("🔔 Reminder: {}", task.title))
+                            .body(&task.description)
+                            .appname("Admin Console")
+                            .show()
+                            .ok();
+                    }
+                }
+                last_checked_minute = current_time_str;
+            }
+
             thread::sleep(Duration::from_secs(1));
         }
     });
@@ -126,6 +163,7 @@ fn main() -> Result<()> {
     let mut files_modified = vec![false, false, false];
 
     loop {
+        // --- ОБРОБКА ПОДІЙ З КАНАЛУ ---
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::ServerUpdate(data) => {
@@ -167,188 +205,139 @@ fn main() -> Result<()> {
 
                 let left_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(10),
-                        Constraint::Length(6)
-                    ])
+                    .constraints([Constraint::Min(10), Constraint::Length(6)])
                     .split(main_chunks[0]);
 
-                // --- TABLE (БЕЗ ГРАФІКА) ---
-                // Залишаємо тільки 3 колонки
-                let header_cells = ["Server", "Ping", "Status"]
-                    .iter()
-                    .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
+                // TABLE
+                let header_cells = ["Server", "Ping", "Status"].iter().map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
                 let header = Row::new(header_cells).height(1).bottom_margin(1);
-
                 let rows = server_data.iter().map(|item| {
                     let ping_text = if item.is_online { format!("{}ms", item.latency) } else { "---".to_string() };
                     let status_symbol = if item.is_online { "🟢" } else { "🔴" };
-
-                    // Колір тепер застосовуємо до тексту пінгу, щоб було наочно
-                    let color = if !item.is_online { Color::Red }
-                    else if item.latency > 100 { Color::Yellow }
-                    else { Color::Green };
-
+                    let color = if !item.is_online { Color::Red } else if item.latency > 100 { Color::Yellow } else { Color::Green };
                     let cells = vec![
                         Cell::from(item.name.clone()),
-                        Cell::from(ping_text).style(Style::default().fg(color)), // Фарбуємо пінг
+                        Cell::from(ping_text).style(Style::default().fg(color)),
                         Cell::from(status_symbol),
                     ];
                     Row::new(cells).height(1)
                 });
-
-                let table = Table::new(rows, [
-                    Constraint::Percentage(50), // Ім'я сервера отримує більше місця
-                    Constraint::Length(30),     // Пінг
-                    Constraint::Length(10),      // Статус (кружечок)
-                ])
+                let table = Table::new(rows, [Constraint::Percentage(50), Constraint::Percentage(30), Constraint::Min(10)])
                     .header(header)
                     .block(Block::default().borders(Borders::ALL).title(" 📡 Servers "));
-
-
                 f.render_stateful_widget(table, left_chunks[0], &mut table_state);
 
-                // --- SYSTEM ---
+                // SYSTEM
                 let sys_block = Block::default().title(" 💻 System ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow));
                 f.render_widget(sys_block, left_chunks[1]);
                 let sys_area = left_chunks[1].inner(Margin { vertical: 1, horizontal: 1 });
-                let gauge_chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(2), Constraint::Length(1), Constraint::Length(2)])
-                    .split(sys_area);
-
+                let gauge_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(2), Constraint::Length(1), Constraint::Length(2)]).split(sys_area);
                 f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Green)).ratio((global_cpu_usage as f64 / 100.0).clamp(0.0, 1.0)).label(format!("CPU: {:.1}%", global_cpu_usage)), gauge_chunks[0]);
                 f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Magenta)).ratio((mem_percentage / 100.0).clamp(0.0, 1.0)).label(format!("RAM: {:.1}%", mem_percentage)), gauge_chunks[2]);
 
-                let right_chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(3), Constraint::Min(0)])
-                    .split(main_chunks[1]);
+                let right_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0)]).split(main_chunks[1]);
 
-                // --- TABS ---
+                // TABS
                 let (current_file_idx, is_actions_active) = match active_view {
                     ActiveView::Editor(mode) => (mode as usize, false),
                     ActiveView::Search { mode_return_to, .. } => (mode_return_to as usize, false),
                     ActiveView::Actions => (0, true),
                     ActiveView::InputPopup { .. } => (0, true),
+                    // Підсвічуємо вкладку Todo, якщо ми в режимі створення завдання
+                    ActiveView::TodoWizard { .. } => (1, true),
                 };
+                let file_tabs = Tabs::new(titles.clone()).block(Block::default().borders(Borders::BOTTOM)).select(if !is_actions_active { current_file_idx } else { 99 }).highlight_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+                f.render_widget(file_tabs, right_chunks[0]);
 
-                let file_tabs = Tabs::new(titles.clone())
-                    .block(Block::default().borders(Borders::BOTTOM))
-                    .select(if !is_actions_active { current_file_idx } else { 99 })
-                    .highlight_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+                let action_status = if is_actions_active { Paragraph::new(" [TAB] ACTIONS ").style(Style::default().fg(Color::Black).bg(Color::Yellow)) } else { Paragraph::new(" [TAB] Actions | [ALT+T] New Task") };
+                f.render_widget(action_status, Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(70), Constraint::Percentage(30)]).split(right_chunks[0])[1]);
 
-                let header_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                    .split(right_chunks[0]);
-
-                f.render_widget(file_tabs, header_chunks[0]);
-
-                let action_status = if is_actions_active {
-                    Paragraph::new(" [TAB] ACTIONS ").style(Style::default().fg(Color::Black).bg(Color::Yellow))
-                } else {
-                    Paragraph::new(" [TAB] to Actions ")
-                };
-                f.render_widget(action_status, header_chunks[1]);
-
-                // --- MAIN CONTENT ---
+                // MAIN CONTENT
                 match &active_view {
                     ActiveView::Editor(mode) | ActiveView::Search { mode_return_to: mode, .. } => {
-                        let idx = *mode as usize;
-                        f.render_widget(&textareas[idx], right_chunks[1]);
+                        f.render_widget(&textareas[*mode as usize], right_chunks[1]);
                     }
                     ActiveView::Actions | ActiveView::InputPopup { .. } => {
-                        let items: Vec<ListItem> = commands
-                            .iter()
-                            .map(|i| ListItem::new(i.name.clone()).style(Style::default().fg(Color::White)))
-                            .collect();
-
-                        let list = List::new(items)
-                            .block(Block::default().borders(Borders::ALL).title(" Оберіть команду "))
-                            .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-                            .highlight_symbol(">> ");
-
+                        let items: Vec<ListItem> = commands.iter().map(|i| ListItem::new(i.name.clone()).style(Style::default().fg(Color::White))).collect();
+                        let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Оберіть команду ")).highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD)).highlight_symbol(">> ");
                         f.render_stateful_widget(list, right_chunks[1], &mut list_state);
+                    }
+                    // Якщо відкритий візард, на фоні показуємо список Todo
+                    ActiveView::TodoWizard { .. } => {
+                        f.render_widget(&textareas[1], right_chunks[1]);
                     }
                 }
 
-                // --- SEARCH BAR ---
+                // POPUPS (Search, Input)
                 if let ActiveView::Search { query, .. } = &active_view {
-                    let area = right_chunks[1];
-                    let search_area = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Min(0), Constraint::Length(3)])
-                        .split(area)[1];
-
-                    let search_block = Paragraph::new(format!("Search: {}", query))
-                        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-                        .style(Style::default().fg(Color::Yellow).bg(Color::Black));
-
+                    let search_area = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(0), Constraint::Length(3)]).split(right_chunks[1])[1];
                     f.render_widget(Clear, search_area);
-                    f.render_widget(search_block, search_area);
+                    f.render_widget(Paragraph::new(format!("Search: {}", query)).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).style(Style::default().fg(Color::Yellow).bg(Color::Black)), search_area);
                 }
-
-                // --- POPUP ---
                 if let ActiveView::InputPopup { input_buffer, .. } = &active_view {
                     let area = centered_rect(60, 20, f.area());
                     f.render_widget(Clear, area);
-
-                    let popup_block = Paragraph::new(input_buffer.clone())
-                        .block(Block::default().borders(Borders::ALL).title(" Введіть аргумент (IP/Host) "))
-                        .style(Style::default().fg(Color::Yellow).bg(Color::Black));
-
-                    f.render_widget(popup_block, area);
+                    f.render_widget(Paragraph::new(input_buffer.clone()).block(Block::default().borders(Borders::ALL).title(" Введіть аргумент (IP/Host) ")).style(Style::default().fg(Color::Yellow).bg(Color::Black)), area);
                 }
-            })?;
 
+                // --- TODO WIZARD POPUP (ВІЗУАЛІЗАЦІЯ) ---
+                if let ActiveView::TodoWizard { step, buffer, temp_title, .. } = &active_view {
+                    let area = centered_rect(60, 20, f.area());
+                    f.render_widget(Clear, area);
+
+                    let (title, content) = match step {
+                        WizardStep::Title => (" 1/3: Назва завдання ", format!("Введіть назву:\n\n> {}", buffer)),
+                        WizardStep::Description => (" 2/3: Опис ", format!("Назва: {}\n\nВведіть опис (можна пустий):\n> {}", temp_title, buffer)),
+                        WizardStep::Time => (" 3/3: Час нагадування ", format!("Назва: {}\n\nВведіть час (HH:MM) або Enter щоб пропустити:\n> {}", temp_title, buffer)),
+                    };
+
+                    let block = Paragraph::new(content)
+                        .block(Block::default().borders(Borders::ALL).title(title))
+                        .style(Style::default().fg(Color::Cyan).bg(Color::Black));
+                    f.render_widget(block, area);
+                }
+
+            })?;
             should_redraw = false;
         }
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-
         if event::poll(timeout)? {
             let evt = event::read()?;
-
             match evt {
                 Event::Paste(data) => {
                     if let ActiveView::Editor(mode) = active_view {
-                        should_redraw = true;
-                        let idx = mode as usize;
-                        textareas[idx].insert_str(data);
-                        files_modified[idx] = true;
+                        textareas[mode as usize].insert_str(data);
+                        files_modified[mode as usize] = true; should_redraw = true;
                     }
                 }
-
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     should_redraw = true;
                     let mut change_view = None;
 
-                    if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('й')) {
-                        break;
+                    if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('й')) { break; }
+
+                    // --- GLOBAL SHORTCUT: ALT + T (ЗАПУСК ВІЗАРДА) ---
+                    if key.modifiers == KeyModifiers::ALT && (key.code == KeyCode::Char('t') || key.code == KeyCode::Char('е')) {
+                        change_view = Some(ActiveView::TodoWizard {
+                            step: WizardStep::Title,
+                            buffer: String::new(),
+                            temp_title: String::new(),
+                            temp_desc: String::new()
+                        });
                     }
+
                     match &mut active_view {
                         ActiveView::Search { mode_return_to, query } => {
                             let idx = *mode_return_to as usize;
                             match key.code {
-                                KeyCode::Esc => {
-                                    textareas[idx].set_search_pattern("").ok();
-                                    change_view = Some(ActiveView::Editor(*mode_return_to));
-                                }
+                                KeyCode::Esc => { textareas[idx].set_search_pattern("").ok(); change_view = Some(ActiveView::Editor(*mode_return_to)); }
                                 KeyCode::Enter => { textareas[idx].search_forward(false); }
-                                KeyCode::Backspace => {
-                                    query.pop();
-                                    textareas[idx].set_search_pattern(query.as_str()).ok();
-                                }
-                                KeyCode::Char(c) => {
-                                    query.push(c);
-                                    textareas[idx].set_search_pattern(query.as_str()).ok();
-                                    textareas[idx].search_forward(false);
-                                }
+                                KeyCode::Backspace => { query.pop(); textareas[idx].set_search_pattern(query.as_str()).ok(); }
+                                KeyCode::Char(c) => { query.push(c); textareas[idx].set_search_pattern(query.as_str()).ok(); textareas[idx].search_forward(false); }
                                 _ => {}
                             }
                         }
-
                         ActiveView::InputPopup { command_idx, input_buffer } => {
                             match key.code {
                                 KeyCode::Enter => {
@@ -356,44 +345,23 @@ fn main() -> Result<()> {
                                     if idx_copy < commands.len() {
                                         let cmd_struct = commands[idx_copy].clone();
                                         let buffer_clone = input_buffer.clone();
-
-                                        let final_args: Vec<String> = cmd_struct.args.iter()
-                                            .map(|arg| if arg == "%INPUT%" { buffer_clone.clone() } else { arg.clone() })
-                                            .collect();
-
+                                        let final_args: Vec<String> = cmd_struct.args.iter().map(|arg| if arg == "%INPUT%" { buffer_clone.clone() } else { arg.clone() }).collect();
                                         change_view = Some(ActiveView::Editor(EditorMode::Logs));
-
                                         let tx_cmd = tx.clone();
                                         let cmd_exe = cmd_struct.cmd.clone();
-
                                         thread::spawn(move || {
                                             let output = Command::new(cmd_exe).args(final_args).output();
-
-                                            // 1. Створюємо змінну для накопичення результату
                                             let mut result_text = String::new();
-
                                             match output {
                                                 Ok(o) => {
                                                     let (decoded_str, _, _) = IBM866.decode(&o.stdout);
                                                     result_text.push_str(&decoded_str);
-
-                                                    if !o.stderr.is_empty() {
-                                                        let (err_str, _, _) = IBM866.decode(&o.stderr);
-                                                        result_text.push_str("\nERROR:\n");
-                                                        result_text.push_str(&err_str);
-                                                    }
+                                                    if !o.stderr.is_empty() { let (err_str, _, _) = IBM866.decode(&o.stderr); result_text.push_str("\nERROR:\n"); result_text.push_str(&err_str); }
                                                 },
                                                 Err(e) => { result_text.push_str(&format!("Failed to run: {}", e)); }
                                             }
-
-                                            // --- ОСЬ ТУТ ГОЛОВНА ЗМІНА ---
-                                            // 2. Створюємо змінну 'text', обрізаючи зайві пробіли
                                             let text = result_text.trim();
-
-                                            // 3. Перевіряємо: якщо текст НЕ пустий (!), то відправляємо в лог
-                                            if !text.is_empty() {
-                                                let _ = tx_cmd.send(AppEvent::LogOutput(text.to_string()));
-                                            }
+                                            if !text.is_empty() { let _ = tx_cmd.send(AppEvent::LogOutput(text.to_string())); }
                                         });
                                     }
                                 }
@@ -404,39 +372,101 @@ fn main() -> Result<()> {
                             }
                         }
 
+                        // --- TODO WIZARD LOGIC (ОБРОБКА ВВОДУ) ---
+                        ActiveView::TodoWizard { step, buffer, temp_title, temp_desc } => {
+                            match key.code {
+                                KeyCode::Esc => { change_view = Some(ActiveView::Editor(EditorMode::Todo)); }
+                                KeyCode::Backspace => { buffer.pop(); }
+                                KeyCode::Char(c) => { buffer.push(c); }
+                                KeyCode::Enter => {
+                                    match step {
+                                        WizardStep::Title => {
+                                            if !buffer.is_empty() {
+                                                *temp_title = buffer.clone();
+                                                buffer.clear();
+                                                *step = WizardStep::Description;
+                                            }
+                                        }
+                                        WizardStep::Description => {
+                                            *temp_desc = buffer.clone();
+                                            buffer.clear();
+                                            *step = WizardStep::Time;
+                                        }
+                                        WizardStep::Time => {
+                                            // ФІНІШ: Створюємо завдання
+                                            let time_str = buffer.trim().to_string(); // Може бути пустим
+
+                                            let new_task = Task {
+                                                title: temp_title.clone(),
+                                                description: temp_desc.clone(),
+                                                time: time_str.clone(),
+                                                completed: false
+                                            };
+
+                                            // 1. Додаємо в список tasks
+                                            tasks.push(new_task);
+                                            // 2. Зберігаємо в tasks.json (для системи)
+                                            let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default());
+
+                                            // 3. Оновлюємо потік моніторингу
+                                            let _ = tx_to_monitor.send(MonitorCommand::UpdateTasks(tasks.clone()));
+
+                                            // 4. Додаємо красиво в todo.txt (для очей)
+                                            let display_str = if time_str.is_empty() {
+                                                format!("- [ ] {}\n      {}", temp_title, temp_desc)
+                                            } else {
+                                                format!("- [⏰ {}] {}\n      {}", time_str, temp_title, temp_desc)
+                                            };
+
+                                            let todo_area = &mut textareas[1];
+                                            todo_area.move_cursor(CursorMove::Bottom);
+                                            todo_area.insert_str("\n");
+                                            todo_area.insert_str(display_str);
+                                            files_modified[1] = true;
+
+                                            change_view = Some(ActiveView::Editor(EditorMode::Todo));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
                         ActiveView::Editor(mode) => {
                             let idx = *mode as usize;
                             let textarea = &mut textareas[idx];
 
+                            // --- CTRL+F (Пошук) ---
                             if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('f') || key.code == KeyCode::Char('а')) {
-                                change_view = Some(ActiveView::Search {
-                                    mode_return_to: *mode,
-                                    query: String::new()
-                                });
+                                change_view = Some(ActiveView::Search { mode_return_to: *mode, query: String::new() });
                             }
+                            // --- CTRL+C (Копіювати) ---
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('с')) {
                                 textarea.copy();
-                                let text = textarea.yank_text();
-                                if !text.is_empty() { if let Some(cb) = &mut clipboard { let _ = cb.set_text(text); } }
+                                if let Some(cb) = &mut clipboard { let _ = cb.set_text(textarea.yank_text()); }
                             }
+                            // --- CTRL+V (Вставити) ---
                             else if (key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('v') || key.code == KeyCode::Char('м'))) ||
                                 (key.modifiers == KeyModifiers::ALT && (key.code == KeyCode::Char('v') || key.code == KeyCode::Char('м'))) {
                                 if let Some(cb) = &mut clipboard {
                                     if let Ok(text) = cb.get_text() { textarea.insert_str(text); files_modified[idx] = true; }
                                 }
                             }
+                            // --- CTRL+X (Вирізати) ---
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('x') || key.code == KeyCode::Char('ч')) {
                                 textarea.cut();
-                                let text = textarea.yank_text();
-                                if let Some(cb) = &mut clipboard { let _ = cb.set_text(text); }
+                                if let Some(cb) = &mut clipboard { let _ = cb.set_text(textarea.yank_text()); }
                                 files_modified[idx] = true;
                             }
+                            // --- CTRL+Z (Undo) ---
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('z') || key.code == KeyCode::Char('я')) {
                                 textarea.undo(); files_modified[idx] = true;
                             }
+                            // --- CTRL+Y (Redo) ---
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('y') || key.code == KeyCode::Char('н')) {
                                 textarea.redo(); files_modified[idx] = true;
                             }
+                            // --- CTRL+A (Виділити все) [ПОВЕРНУЛИ] ---
                             else if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('ф')) {
                                 textarea.move_cursor(CursorMove::Top);
                                 textarea.move_cursor(CursorMove::Head);
@@ -445,6 +475,7 @@ fn main() -> Result<()> {
                                 textarea.move_cursor(CursorMove::End);
                                 is_selecting = true;
                             }
+                            // --- CTRL+SHIFT+ARROWS (Виділення по словах) [ПОВЕРНУЛИ] ---
                             else if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) && key.code == KeyCode::Left {
                                 if !is_selecting { textarea.start_selection(); is_selecting = true; }
                                 textarea.move_cursor(CursorMove::WordBack);
@@ -453,6 +484,7 @@ fn main() -> Result<()> {
                                 if !is_selecting { textarea.start_selection(); is_selecting = true; }
                                 textarea.move_cursor(CursorMove::WordForward);
                             }
+                            // --- CTRL+ARROWS (Рух по словах) [ПОВЕРНУЛИ] ---
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Left {
                                 textarea.cancel_selection(); is_selecting = false;
                                 textarea.move_cursor(CursorMove::WordBack);
@@ -461,26 +493,19 @@ fn main() -> Result<()> {
                                 textarea.cancel_selection(); is_selecting = false;
                                 textarea.move_cursor(CursorMove::WordForward);
                             }
+                            // --- CTRL+BACKSPACE (Видалити слово) [ПОВЕРНУЛИ] ---
                             else if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Backspace {
                                 textarea.delete_word(); is_selecting = false; files_modified[idx] = true;
                             }
+                            // --- ЗВИЧАЙНИЙ ВВІД ---
                             else {
                                 match key.code {
                                     KeyCode::Esc => break,
-                                    KeyCode::Tab => {
-                                        change_view = Some(ActiveView::Actions);
-                                    }
-                                    KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
-                                        change_view = Some(ActiveView::Editor(EditorMode::Notes));
-                                    }
-                                    KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
-                                        change_view = Some(ActiveView::Editor(EditorMode::Todo));
-                                    }
-                                    KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
-                                        change_view = Some(ActiveView::Editor(EditorMode::Logs));
-                                    }
-                                    KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace |
-                                    KeyCode::Delete => {
+                                    KeyCode::Tab => { change_view = Some(ActiveView::Actions); }
+                                    KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => { change_view = Some(ActiveView::Editor(EditorMode::Notes)); }
+                                    KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => { change_view = Some(ActiveView::Editor(EditorMode::Todo)); }
+                                    KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => { change_view = Some(ActiveView::Editor(EditorMode::Logs)); }
+                                    KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => {
                                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT { is_selecting = false; }
                                         textarea.input(key); files_modified[idx] = true;
                                     },
@@ -492,67 +517,36 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-
                         ActiveView::Actions => {
                             match key.code {
                                 KeyCode::Esc => { change_view = Some(ActiveView::Editor(EditorMode::Notes)); }
                                 KeyCode::Tab => { change_view = Some(ActiveView::Editor(EditorMode::Notes)); }
-                                KeyCode::Down => {
-                                    if !commands.is_empty() {
-                                        let i = match list_state.selected() {
-                                            Some(i) => if i >= commands.len() - 1 { 0 } else { i + 1 },
-                                            None => 0,
-                                        };
-                                        list_state.select(Some(i));
-                                    }
-                                }
-                                KeyCode::Up => {
-                                    if !commands.is_empty() {
-                                        let i = match list_state.selected() {
-                                            Some(i) => if i == 0 { commands.len() - 1 } else { i - 1 },
-                                            None => 0,
-                                        };
-                                        list_state.select(Some(i));
-                                    }
-                                }
+                                KeyCode::Down => { if !commands.is_empty() { let i = match list_state.selected() { Some(i) => if i >= commands.len() - 1 { 0 } else { i + 1 }, None => 0, }; list_state.select(Some(i)); } }
+                                KeyCode::Up => { if !commands.is_empty() { let i = match list_state.selected() { Some(i) => if i == 0 { commands.len() - 1 } else { i - 1 }, None => 0, }; list_state.select(Some(i)); } }
                                 KeyCode::Enter => {
                                     if let Some(i) = list_state.selected() {
                                         if i < commands.len() {
                                             let cmd_struct = commands[i].clone();
-
                                             if cmd_struct.args.contains(&"%INPUT%".to_string()) {
-                                                change_view = Some(ActiveView::InputPopup {
-                                                    command_idx: i,
-                                                    input_buffer: String::new()
-                                                });
+                                                change_view = Some(ActiveView::InputPopup { command_idx: i, input_buffer: String::new() });
                                             } else {
                                                 change_view = Some(ActiveView::Editor(EditorMode::Logs));
                                                 let tx_cmd = tx.clone();
                                                 let cmd_exe = cmd_struct.cmd.clone();
                                                 let cmd_args = cmd_struct.args.clone();
-
                                                 thread::spawn(move || {
-                                                    // ТУТ ПРАВИЛЬНО: Використовуємо cmd_args
                                                     let output = Command::new(cmd_exe).args(cmd_args).output();
-
                                                     let mut result_text = String::new();
                                                     match output {
                                                         Ok(o) => {
                                                             let (decoded_str, _, _) = IBM866.decode(&o.stdout);
                                                             result_text.push_str(&decoded_str);
-                                                            if !o.stderr.is_empty() {
-                                                                let (err_str, _, _) = IBM866.decode(&o.stderr);
-                                                                result_text.push_str("\nERROR:\n");
-                                                                result_text.push_str(&err_str);
-                                                            }
+                                                            if !o.stderr.is_empty() { let (err_str, _, _) = IBM866.decode(&o.stderr); result_text.push_str("\nERROR:\n"); result_text.push_str(&err_str); }
                                                         },
                                                         Err(e) => { result_text.push_str(&format!("Failed to run: {}", e)); }
                                                     }
-
                                                     let text = result_text.trim();
-                                                    if !text.is_empty() {
-                                                        let _ = tx_cmd.send(AppEvent::LogOutput(text.to_string()));
-                                                    }
+                                                    if !text.is_empty() { let _ = tx_cmd.send(AppEvent::LogOutput(text.to_string())); }
                                                 });
                                             }
                                         }
@@ -563,9 +557,7 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    if let Some(new_view) = change_view {
-                        active_view = new_view;
-                    }
+                    if let Some(new_view) = change_view { active_view = new_view; }
                 }
                 _ => {}
             }
@@ -580,11 +572,7 @@ fn main() -> Result<()> {
         }
     }
 
-    for (i, filename) in file_names.iter().enumerate() {
-        let text_to_save = textareas[i].lines().join("\n");
-        fs::write(filename, text_to_save)?;
-    }
-
+    for (i, filename) in file_names.iter().enumerate() { let text_to_save = textareas[i].lines().join("\n"); fs::write(filename, text_to_save)?; }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
