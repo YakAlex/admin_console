@@ -1,4 +1,3 @@
-// Підключаємо наші нові модулі
 mod config;
 mod types;
 mod utils;
@@ -11,7 +10,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, Gauge, List, ListItem, ListState, Tabs, Table, Row, Cell, Clear},
+    widgets::{Block, Borders, Paragraph, Gauge, List, ListItem, ListState, Tabs, Table, Row, Cell, Clear, TableState},
     style::{Color, Modifier, Style},
 };
 use std::{fs, io, net::TcpStream, process::Command, sync::mpsc, thread, time::{Duration, Instant}, collections::VecDeque};
@@ -19,11 +18,12 @@ use tui_textarea::{TextArea, CursorMove};
 use sysinfo::System;
 use encoding_rs::IBM866;
 use arboard::Clipboard;
+use chrono::Local;
+use notify_rust::Notification;
 
-// Використовуємо типи з наших нових файлів
 use crate::config::AppConfig;
 use crate::types::{ServerStatus, AppEvent, EditorMode, ActiveView};
-use crate::utils::{generate_sparkline, centered_rect};
+use crate::utils::centered_rect; // Прибрали generate_sparkline
 
 fn main() -> Result<()> {
     // --- ІНІЦІАЛІЗАЦІЯ ---
@@ -51,9 +51,10 @@ fn main() -> Result<()> {
     let commands = config.commands.clone();
 
     let mut list_state = ListState::default();
-    if !commands.is_empty() {
-        list_state.select(Some(0));
-    }
+    if !commands.is_empty() { list_state.select(Some(0)); }
+
+    let mut table_state = TableState::default();
+    if !targets_for_thread.is_empty() { table_state.select(Some(0)); }
 
     let mut active_view = ActiveView::Editor(EditorMode::Notes);
     let (tx, rx) = mpsc::channel::<AppEvent>();
@@ -61,7 +62,7 @@ fn main() -> Result<()> {
 
     let tx_monitor = tx.clone();
 
-    // --- ФОНОВИЙ ПОТІК (МОНІТОРИНГ) ---
+    // --- ФОНОВИЙ ПОТІК ---
     thread::spawn(move || {
         let mut statuses: Vec<ServerStatus> = targets_for_thread.iter().map(|t| ServerStatus {
             name: t.name.clone(),
@@ -69,6 +70,8 @@ fn main() -> Result<()> {
             latency: 0,
             history: VecDeque::from(vec![0; 20]),
         }).collect();
+
+        let mut previous_online_status: Vec<bool> = vec![true; targets_for_thread.len()];
 
         loop {
             for (i, target) in targets_for_thread.iter().enumerate() {
@@ -82,9 +85,26 @@ fn main() -> Result<()> {
                 status.is_online = online;
                 status.latency = lat;
 
+                // Логіка історії залишається для внутрішніх потреб, але не відображається
                 let history_val = if status.is_online { status.latency } else { 999 };
                 status.history.pop_front();
                 status.history.push_back(history_val);
+
+                if previous_online_status[i] && !online {
+                    let timestamp = Local::now().format("%H:%M:%S");
+                    let log_msg = format!("[{}] 🔴 ALERT: Server '{}' went OFFLINE!", timestamp, target.name);
+                    // 1. Пишемо в лог (як і раніше)
+                    let _ = tx_monitor.send(AppEvent::LogOutput(log_msg));
+
+                    // 2. ВІДПРАВЛЯЄМО WINDOWS-ПОВІДОМЛЕННЯ
+                    Notification::new()
+                        .summary("SERVER DOWN ⚠️")
+                        .body(&format!("Увага! Сервер '{}' перестав відповідати.", target.name))
+                        .appname("Admin Console")
+                        .show()
+                        .ok();
+                }
+                previous_online_status[i] = online;
             }
             let _ = tx_monitor.send(AppEvent::ServerUpdate(statuses.clone()));
             thread::sleep(Duration::from_secs(1));
@@ -114,7 +134,12 @@ fn main() -> Result<()> {
                 }
                 AppEvent::LogOutput(text) => {
                     let log_textarea = &mut textareas[2];
-                    log_textarea.insert_str(text);
+                    if text.starts_with('[') {
+                        log_textarea.insert_str(text);
+                    } else {
+                        let timestamp = Local::now().format("%H:%M:%S");
+                        log_textarea.insert_str(format!("[{}] Output:\n{}", timestamp, text));
+                    }
                     log_textarea.insert_str("\n--------------------------\n");
                     files_modified[2] = true;
                     should_redraw = true;
@@ -140,17 +165,17 @@ fn main() -> Result<()> {
                     .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
                     .split(f.area());
 
-                // ✅ НОВИЙ ВАРІАНТ (Адаптивний)
                 let left_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Min(10),  // Таблиця серверів забирає ВСЕ вільне місце (мінімум 10 рядків)
-                        Constraint::Length(6) // Нижня панель (System) завжди фіксована — 6 рядків
+                        Constraint::Min(10),
+                        Constraint::Length(6)
                     ])
                     .split(main_chunks[0]);
 
-                // --- TABLE ---
-                let header_cells = ["Server", "Ping", "Status", "History"]
+                // --- TABLE (БЕЗ ГРАФІКА) ---
+                // Залишаємо тільки 3 колонки
+                let header_cells = ["Server", "Ping", "Status"]
                     .iter()
                     .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
                 let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -158,29 +183,30 @@ fn main() -> Result<()> {
                 let rows = server_data.iter().map(|item| {
                     let ping_text = if item.is_online { format!("{}ms", item.latency) } else { "---".to_string() };
                     let status_symbol = if item.is_online { "🟢" } else { "🔴" };
+
+                    // Колір тепер застосовуємо до тексту пінгу, щоб було наочно
                     let color = if !item.is_online { Color::Red }
                     else if item.latency > 100 { Color::Yellow }
                     else { Color::Green };
-                    let sparkline = generate_sparkline(&item.history);
 
                     let cells = vec![
                         Cell::from(item.name.clone()),
-                        Cell::from(ping_text),
+                        Cell::from(ping_text).style(Style::default().fg(color)), // Фарбуємо пінг
                         Cell::from(status_symbol),
-                        Cell::from(sparkline).style(Style::default().fg(color)),
                     ];
                     Row::new(cells).height(1)
                 });
 
                 let table = Table::new(rows, [
-                    Constraint::Length(12),
-                    Constraint::Length(6),
-                    Constraint::Length(4),
-                    Constraint::Min(10),
+                    Constraint::Percentage(50), // Ім'я сервера отримує більше місця
+                    Constraint::Length(30),     // Пінг
+                    Constraint::Length(10),      // Статус (кружечок)
                 ])
                     .header(header)
                     .block(Block::default().borders(Borders::ALL).title(" 📡 Servers "));
-                f.render_widget(table, left_chunks[0]);
+
+
+                f.render_stateful_widget(table, left_chunks[0], &mut table_state);
 
                 // --- SYSTEM ---
                 let sys_block = Block::default().title(" 💻 System ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow));
@@ -301,9 +327,7 @@ fn main() -> Result<()> {
                     if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('й')) {
                         break;
                     }
-
                     match &mut active_view {
-                        // === РЕЖИМ ПОШУКУ ===
                         ActiveView::Search { mode_return_to, query } => {
                             let idx = *mode_return_to as usize;
                             match key.code {
@@ -311,9 +335,7 @@ fn main() -> Result<()> {
                                     textareas[idx].set_search_pattern("").ok();
                                     change_view = Some(ActiveView::Editor(*mode_return_to));
                                 }
-                                KeyCode::Enter => {
-                                    textareas[idx].search_forward(false);
-                                }
+                                KeyCode::Enter => { textareas[idx].search_forward(false); }
                                 KeyCode::Backspace => {
                                     query.pop();
                                     textareas[idx].set_search_pattern(query.as_str()).ok();
@@ -327,7 +349,6 @@ fn main() -> Result<()> {
                             }
                         }
 
-                        // === РЕЖИМ POPUP ВВОДУ ===
                         ActiveView::InputPopup { command_idx, input_buffer } => {
                             match key.code {
                                 KeyCode::Enter => {
@@ -341,20 +362,21 @@ fn main() -> Result<()> {
                                             .collect();
 
                                         change_view = Some(ActiveView::Editor(EditorMode::Logs));
-                                        let log_textarea = &mut textareas[2];
-                                        log_textarea.insert_str(format!("\n--- Executing (Async): {} ({}) ---\n", cmd_struct.name, buffer_clone));
-                                        files_modified[2] = true;
 
                                         let tx_cmd = tx.clone();
                                         let cmd_exe = cmd_struct.cmd.clone();
 
                                         thread::spawn(move || {
                                             let output = Command::new(cmd_exe).args(final_args).output();
+
+                                            // 1. Створюємо змінну для накопичення результату
                                             let mut result_text = String::new();
+
                                             match output {
                                                 Ok(o) => {
                                                     let (decoded_str, _, _) = IBM866.decode(&o.stdout);
                                                     result_text.push_str(&decoded_str);
+
                                                     if !o.stderr.is_empty() {
                                                         let (err_str, _, _) = IBM866.decode(&o.stderr);
                                                         result_text.push_str("\nERROR:\n");
@@ -363,7 +385,15 @@ fn main() -> Result<()> {
                                                 },
                                                 Err(e) => { result_text.push_str(&format!("Failed to run: {}", e)); }
                                             }
-                                            let _ = tx_cmd.send(AppEvent::LogOutput(result_text));
+
+                                            // --- ОСЬ ТУТ ГОЛОВНА ЗМІНА ---
+                                            // 2. Створюємо змінну 'text', обрізаючи зайві пробіли
+                                            let text = result_text.trim();
+
+                                            // 3. Перевіряємо: якщо текст НЕ пустий (!), то відправляємо в лог
+                                            if !text.is_empty() {
+                                                let _ = tx_cmd.send(AppEvent::LogOutput(text.to_string()));
+                                            }
                                         });
                                     }
                                 }
@@ -374,7 +404,6 @@ fn main() -> Result<()> {
                             }
                         }
 
-                        // === РЕЖИМ РЕДАКТОРА ===
                         ActiveView::Editor(mode) => {
                             let idx = *mode as usize;
                             let textarea = &mut textareas[idx];
@@ -464,15 +493,10 @@ fn main() -> Result<()> {
                             }
                         }
 
-                        // === РЕЖИМ МЕНЮ ДІЙ ===
                         ActiveView::Actions => {
                             match key.code {
-                                KeyCode::Esc => {
-                                    change_view = Some(ActiveView::Editor(EditorMode::Notes));
-                                }
-                                KeyCode::Tab => {
-                                    change_view = Some(ActiveView::Editor(EditorMode::Notes));
-                                }
+                                KeyCode::Esc => { change_view = Some(ActiveView::Editor(EditorMode::Notes)); }
+                                KeyCode::Tab => { change_view = Some(ActiveView::Editor(EditorMode::Notes)); }
                                 KeyCode::Down => {
                                     if !commands.is_empty() {
                                         let i = match list_state.selected() {
@@ -503,16 +527,14 @@ fn main() -> Result<()> {
                                                 });
                                             } else {
                                                 change_view = Some(ActiveView::Editor(EditorMode::Logs));
-                                                let log_textarea = &mut textareas[2];
-                                                log_textarea.insert_str(format!("\n--- Executing (Async): {} ---\n", cmd_struct.name));
-                                                files_modified[2] = true;
-
                                                 let tx_cmd = tx.clone();
                                                 let cmd_exe = cmd_struct.cmd.clone();
                                                 let cmd_args = cmd_struct.args.clone();
 
                                                 thread::spawn(move || {
+                                                    // ТУТ ПРАВИЛЬНО: Використовуємо cmd_args
                                                     let output = Command::new(cmd_exe).args(cmd_args).output();
+
                                                     let mut result_text = String::new();
                                                     match output {
                                                         Ok(o) => {
@@ -526,7 +548,11 @@ fn main() -> Result<()> {
                                                         },
                                                         Err(e) => { result_text.push_str(&format!("Failed to run: {}", e)); }
                                                     }
-                                                    let _ = tx_cmd.send(AppEvent::LogOutput(result_text));
+
+                                                    let text = result_text.trim();
+                                                    if !text.is_empty() {
+                                                        let _ = tx_cmd.send(AppEvent::LogOutput(text.to_string()));
+                                                    }
                                                 });
                                             }
                                         }
