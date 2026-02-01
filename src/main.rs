@@ -15,7 +15,7 @@ use ratatui::{
 };
 use std::{fs, io, net::TcpStream, process::Command, sync::mpsc, thread, time::{Duration, Instant}, collections::VecDeque};
 use tui_textarea::{TextArea, CursorMove};
-use sysinfo::System;
+
 use encoding_rs::IBM866;
 use arboard::Clipboard;
 use chrono::Local;
@@ -23,7 +23,7 @@ use notify_rust::Notification;
 
 use crate::config::AppConfig;
 use crate::types::{ServerStatus, AppEvent, EditorMode, ActiveView, MonitorCommand, Task, WizardStep};
-use crate::utils::centered_rect;
+use crate::utils::{centered_rect, is_valid_time, parse_tasks_from_text};
 
 fn main() -> Result<()> {
     // --- ІНІЦІАЛІЗАЦІЯ ---
@@ -131,16 +131,20 @@ fn main() -> Result<()> {
             // 3. ПЕРЕВІРКА НАГАДУВАНЬ
             let current_time_str = Local::now().format("%H:%M").to_string();
 
-            // Перевіряємо тільки якщо настала нова хвилина
             if current_time_str != last_checked_minute {
                 for task in &thread_tasks {
-                    if !task.time.is_empty() && task.time == current_time_str {
+                    // Перевіряємо, чи настав час і чи завдання ще не виконане
+                    if !task.completed && !task.time.is_empty() && task.time == current_time_str {
+                        // 1. Показуємо повідомлення
                         Notification::new()
                             .summary(&format!("🔔 Reminder: {}", task.title))
                             .body(&task.description)
                             .appname("Admin Console")
                             .show()
                             .ok();
+
+                        // 2. Надсилаємо сигнал у головний потік, щоб помітити завдання як виконане
+                        let _ = tx_monitor.send(AppEvent::TaskCompleted(task.title.clone()));
                     }
                 }
                 last_checked_minute = current_time_str;
@@ -150,7 +154,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let mut sys = System::new_all();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -165,6 +169,17 @@ fn main() -> Result<()> {
     let mut files_modified = vec![false, false, false];
 
     loop {
+        // --- СИНХРОНІЗАЦІЯ (TEXT -> JSON) ---
+        // Якщо текст Todo (індекс 1) змінився, ми перечитуємо tasks
+        // Це покриває і ручне редагування, і додавання через Wizard
+        if files_modified[1] {
+            let content = textareas[1].lines().join("\n");
+            tasks = parse_tasks_from_text(&content);
+            tasks_modified = true; // Щоб потім зберегти json
+
+            // Одразу оновлюємо монітор, щоб нагадування працювали коректно
+            let _ = tx_to_monitor.send(MonitorCommand::UpdateTasks(tasks.clone()));
+        }
         // --- ОБРОБКА ПОДІЙ З КАНАЛУ ---
         while let Ok(event) = rx.try_recv() {
             match event {
@@ -184,33 +199,75 @@ fn main() -> Result<()> {
                     files_modified[2] = true;
                     should_redraw = true;
                 }
+
+                AppEvent::TaskCompleted(title) => {
+                    let todo_textarea = &mut textareas[1];
+                    let old_lines = todo_textarea.lines().to_vec();
+
+                    let mut new_lines = Vec::new();
+                    let mut modified = false;
+
+                    for line in old_lines {
+                        // Шукаємо невиконане завдання з такою назвою
+                        if line.contains(&title) && line.trim().starts_with("- [") && !line.contains("[x]") && !line.contains("[X]") {
+                            let start_bracket = line.find('[').unwrap_or(0);
+                            let end_bracket = line.find(']').unwrap_or(line.len());
+
+                            if end_bracket > start_bracket {
+                                // Замінюємо час на [x]
+                                let new_line = format!("{}[x]{}", &line[..start_bracket], &line[end_bracket + 1..]);
+                                new_lines.push(new_line);
+                                modified = true;
+                            } else {
+                                new_lines.push(line);
+                            }
+                        } else {
+                            new_lines.push(line);
+                        }
+                    }
+
+                    if modified {
+                        // 1. Оновлюємо візуальний текст
+                        *todo_textarea = TextArea::new(new_lines);
+                        todo_textarea.set_block(Block::default().borders(Borders::ALL));
+
+                        // 2. ПРИМУСОВА СИНХРОНІЗАЦІЯ (ТУТ БУЛА ПРОБЛЕМА)
+                        // Ми не чекаємо циклу, а парсимо текст прямо зараз
+                        let content = todo_textarea.lines().join("\n");
+                        tasks = parse_tasks_from_text(&content);
+
+                        // 3. Відправляємо оновлений список монітору (щоб він перестав нагадувати)
+                        let _ = tx_to_monitor.send(MonitorCommand::UpdateTasks(tasks.clone()));
+
+                        // 4. Позначаємо, що треба зберегти JSON і Текст
+                        files_modified[1] = true;
+                        tasks_modified = true;
+                        should_redraw = true;
+                    }
+                }
+
             }
         }
 
         if last_tick.elapsed() >= tick_rate {
-            sys.refresh_all();
             should_redraw = true;
             last_tick = Instant::now();
         }
 
         if should_redraw {
-            let global_cpu_usage = sys.global_cpu_info().cpu_usage();
-            let used_mem = sys.used_memory();
-            let total_mem = sys.total_memory();
-            let mem_percentage = if total_mem > 0 { (used_mem as f64 / total_mem as f64) * 100.0 } else { 0.0 };
-
             terminal.draw(|f| {
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
                     .split(f.area());
 
+                // ЗМІНА 1: Збільшили висоту нижнього блоку з 6 до 8, щоб влізло 5 рядків
                 let left_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(10), Constraint::Length(6)])
+                    .constraints([Constraint::Min(10), Constraint::Length(8)])
                     .split(main_chunks[0]);
 
-                // TABLE
+                // --- TABLE (СЕРВЕРИ) ---
                 let header_cells = ["Server", "Ping", "Status"].iter().map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
                 let header = Row::new(header_cells).height(1).bottom_margin(1);
                 let rows = server_data.iter().map(|item| {
@@ -229,13 +286,66 @@ fn main() -> Result<()> {
                     .block(Block::default().borders(Borders::ALL).title(" 📡 Servers "));
                 f.render_stateful_widget(table, left_chunks[0], &mut table_state);
 
-                // SYSTEM
-                let sys_block = Block::default().title(" 💻 System ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow));
-                f.render_widget(sys_block, left_chunks[1]);
-                let sys_area = left_chunks[1].inner(Margin { vertical: 1, horizontal: 1 });
-                let gauge_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(2), Constraint::Length(1), Constraint::Length(2)]).split(sys_area);
-                f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Green)).ratio((global_cpu_usage as f64 / 100.0).clamp(0.0, 1.0)).label(format!("CPU: {:.1}%", global_cpu_usage)), gauge_chunks[0]);
-                f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Magenta)).ratio((mem_percentage / 100.0).clamp(0.0, 1.0)).label(format!("RAM: {:.1}%", mem_percentage)), gauge_chunks[2]);
+                // --- SCHEDULE (НОВИЙ БЛОК ЗАМІСТЬ SYSTEM) ---
+                let mut active_tasks: Vec<&Task> = tasks.iter().filter(|t| !t.completed).collect();
+
+                // Сортування (Час -> Без часу)
+                active_tasks.sort_by(|a, b| {
+                    let a_has_time = !a.time.is_empty();
+                    let b_has_time = !b.time.is_empty();
+                    if a_has_time && b_has_time { a.time.cmp(&b.time) }
+                    else if a_has_time { std::cmp::Ordering::Less }
+                    else if b_has_time { std::cmp::Ordering::Greater }
+                    else { a.title.cmp(&b.title) }
+                });
+
+                let mut items = Vec::new();
+                let mut first_untimed_seen = false;
+
+                // Беремо до 6 елементів, щоб якщо є розділювач, він вліз
+                for (i, task) in active_tasks.iter().take(5).enumerate() {
+                    let has_time = !task.time.is_empty();
+
+                    // --- РОЗДІЛЮВАЧ ---
+                    // Якщо ми перейшли від "з часом" до "без часу" — малюємо лінію
+                    if i > 0 && !has_time && !first_untimed_seen {
+                        items.push(ListItem::new(" ──────────────────────").style(Style::default().fg(Color::DarkGray)));
+                        first_untimed_seen = true;
+                    }
+
+                    // --- ФОРМАТУВАННЯ ---
+                    let (prefix, style) = if has_time {
+                        // ⏰ 14:00 (разом з іконкою займає фіксовану ширину)
+                        (format!(" ⏰ {} │ ", task.time), Style::default().fg(Color::Yellow))
+                    } else {
+                        // 📝  --   (підганяємо пробіли, щоб вертикальна лінія │ співпала)
+                        (" 📝  --   │ ".to_string(), Style::default().fg(Color::Cyan))
+                    };
+
+                    // Обрізаємо назву, якщо вона довга
+                    let title = if task.title.len() > 18 {
+                        format!("{}..", &task.title[..18])
+                    } else {
+                        task.title.clone()
+                    };
+
+                    items.push(ListItem::new(format!("{}{}", prefix, title)).style(style));
+
+                    // Якщо це перше завдання без часу (і воно найперше в списку), помічаємо це
+                    if !has_time { first_untimed_seen = true; }
+                }
+
+                let list_widget = if items.is_empty() {
+                    List::new(vec![ListItem::new("   (No active tasks)").style(Style::default().fg(Color::DarkGray))])
+                } else {
+                    List::new(items)
+                };
+
+                let schedule_block = list_widget
+                    .block(Block::default().borders(Borders::ALL).title(" 📅 Schedule "))
+                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+
+                f.render_widget(schedule_block, left_chunks[1]);
 
                 let right_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0)]).split(main_chunks[1]);
 
@@ -396,37 +506,33 @@ fn main() -> Result<()> {
                                             *step = WizardStep::Time;
                                         }
                                         WizardStep::Time => {
-                                            // ФІНІШ: Створюємо завдання
-                                            let time_str = buffer.trim().to_string(); // Може бути пустим
+                                            // 1. ВАЛІДАЦІЯ: Перевіряємо час
+                                            // Якщо час валідний — виконуємо логіку.
+                                            // Якщо ні — просто ігноруємо натискання Enter (користувач залишиться на цьому етапі)
+                                            if is_valid_time(&buffer) {
+                                                let time_str = buffer.trim().to_string();
 
-                                            let new_task = Task {
-                                                title: temp_title.clone(),
-                                                description: temp_desc.clone(),
-                                                time: time_str.clone(),
-                                                completed: false
-                                            };
+                                                // 2. Формуємо рядок для todo.txt (БЕЗ іконок, просто [14:00])
+                                                let display_str = if time_str.is_empty() {
+                                                    format!("- [ ] {}\n      {}", temp_title, temp_desc)
+                                                } else {
+                                                    format!("- [{}] {}\n      {}", time_str, temp_title, temp_desc)
+                                                };
 
-                                            // 1. Додаємо в список tasks
-                                            tasks.push(new_task);
-                                            // 2. ПОМІЧАЄМО ЯК ЗМІНЕНЕ (не пишемо на диск)
-                                            tasks_modified = true;
-                                            // 3. Оновлюємо потік моніторингу
-                                            let _ = tx_to_monitor.send(MonitorCommand::UpdateTasks(tasks.clone()));
+                                                // 3. Додаємо ТІЛЬКИ в текстовий редактор
+                                                let todo_area = &mut textareas[1];
+                                                todo_area.move_cursor(CursorMove::Bottom);
+                                                // Додаємо відступ, якщо файл не пустий
+                                                if !todo_area.lines().is_empty() { todo_area.insert_str("\n"); }
+                                                todo_area.insert_str(display_str);
 
-                                            // 4. Додаємо красиво в todo.txt (для очей)
-                                            let display_str = if time_str.is_empty() {
-                                                format!("- [ ] {}\n      {}", temp_title, temp_desc)
-                                            } else {
-                                                format!("- [⏰ {}] {}\n      {}", time_str, temp_title, temp_desc)
-                                            };
+                                                // Ставимо прапорець, що файл змінився
+                                                files_modified[1] = true;
 
-                                            let todo_area = &mut textareas[1];
-                                            todo_area.move_cursor(CursorMove::Bottom);
-                                            todo_area.insert_str("\n");
-                                            todo_area.insert_str(display_str);
-                                            files_modified[1] = true;
-
-                                            change_view = Some(ActiveView::Editor(EditorMode::Todo));
+                                                // Виходимо з візарда
+                                                change_view = Some(ActiveView::Editor(EditorMode::Todo));
+                                            }
+                                            // else { тут нічого не робимо, користувач далі редагує buffer }
                                         }
                                     }
                                 }

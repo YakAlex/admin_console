@@ -21,6 +21,7 @@ pub struct Task {
 pub enum AppEvent {
     ServerUpdate(Vec<ServerStatus>),
     LogOutput(String),
+    TaskCompleted(String),
 }
 
 // Команди для фонового потоку
