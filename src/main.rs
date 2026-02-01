@@ -70,6 +70,8 @@ fn main() -> Result<()> {
 
     let mut clipboard = Clipboard::new().ok();
     let tx_monitor = tx.clone();
+    let mut last_user_activity = Instant::now(); // Коли користувач востаннє щось натискав
+    let mut tasks_modified = false;              // Чи змінювали ми список завдань
 
     // --- ФОНОВИЙ ПОТІК (МОНІТОРИНГ + НАГАДУВАННЯ) ---
     thread::spawn(move || {
@@ -178,7 +180,7 @@ fn main() -> Result<()> {
                         let timestamp = Local::now().format("%H:%M:%S");
                         log_textarea.insert_str(format!("[{}] Output:\n{}", timestamp, text));
                     }
-                    log_textarea.insert_str("\n--------------------------\n");
+                    log_textarea.insert_str("\n-------------------------------------------\n");
                     files_modified[2] = true;
                     should_redraw = true;
                 }
@@ -306,17 +308,18 @@ fn main() -> Result<()> {
             let evt = event::read()?;
             match evt {
                 Event::Paste(data) => {
+                    last_user_activity = Instant::now();
                     if let ActiveView::Editor(mode) = active_view {
                         textareas[mode as usize].insert_str(data);
                         files_modified[mode as usize] = true; should_redraw = true;
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    last_user_activity = Instant::now();
                     should_redraw = true;
                     let mut change_view = None;
 
                     if key.modifiers == KeyModifiers::CONTROL && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('й')) { break; }
-
                     // --- GLOBAL SHORTCUT: ALT + T (ЗАПУСК ВІЗАРДА) ---
                     if key.modifiers == KeyModifiers::ALT && (key.code == KeyCode::Char('t') || key.code == KeyCode::Char('е')) {
                         change_view = Some(ActiveView::TodoWizard {
@@ -405,9 +408,8 @@ fn main() -> Result<()> {
 
                                             // 1. Додаємо в список tasks
                                             tasks.push(new_task);
-                                            // 2. Зберігаємо в tasks.json (для системи)
-                                            let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default());
-
+                                            // 2. ПОМІЧАЄМО ЯК ЗМІНЕНЕ (не пишемо на диск)
+                                            tasks_modified = true;
                                             // 3. Оновлюємо потік моніторингу
                                             let _ = tx_to_monitor.send(MonitorCommand::UpdateTasks(tasks.clone()));
 
@@ -563,16 +565,35 @@ fn main() -> Result<()> {
             }
         }
 
-        for (i, modified) in files_modified.iter_mut().enumerate() {
-            if *modified {
-                let text_to_save = textareas[i].lines().join("\n");
-                fs::write(file_names[i], text_to_save).ok();
-                *modified = false;
+        // --- АВТОЗБЕРЕЖЕННЯ (30 СЕКУНД ТИШІ) ---
+        if last_user_activity.elapsed() >= Duration::from_secs(30) {
+
+            // 1. Зберігаємо текстові файли (Notes, Todo, Logs)
+            for (i, modified) in files_modified.iter_mut().enumerate() {
+                if *modified {
+                    let text_to_save = textareas[i].lines().join("\n");
+                    // Використовуємо .ok(), щоб не крашити програму при помилці запису
+                    fs::write(file_names[i], text_to_save).ok();
+                    *modified = false; // Скидаємо прапорець
+                }
+            }
+
+            if tasks_modified {
+                let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default());
+                tasks_modified = false;
             }
         }
     }
 
-    for (i, filename) in file_names.iter().enumerate() { let text_to_save = textareas[i].lines().join("\n"); fs::write(filename, text_to_save)?; }
+    for (i, filename) in file_names.iter().enumerate() {
+        let text_to_save = textareas[i].lines().join("\n");
+        fs::write(filename, text_to_save)?;
+    }
+
+    if tasks_modified {
+        let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default());
+    }
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
