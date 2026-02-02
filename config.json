@@ -1,7 +1,6 @@
 {
 "targets": [
 { "name": "Google DNS", "address": "8.8.8.8:53" },
-{ "name": "Punkt Nez", "address": "91.142.174.34:80" },
 { "name": "Kiev-dc1", "address": "192.168.244.86:3389" },
 { "name": "Kiev-dc2", "address": "192.168.244.88:3389" },
 { "name": "Dbserv2", "address": "192.168.244.74:3389" },
@@ -19,7 +18,7 @@
 "commands": [
 { "name": "Ping Custom IP", "cmd": "ping", "args": ["%INPUT%"] },
 { "name": "IP Config", "cmd": "ipconfig", "args": ["/all"] },
-  {"name": "Open New CMD", "cmd": "cmd", "args": ["/c", "start", "Local Shell", "cmd"] },
-  {"name": "Open Admin CMD", "cmd": "powershell", "args": ["Start-Process", "cmd", "-Verb", "RunAs"]}
+{"name": "Open New CMD", "cmd": "cmd", "args": ["/c", "start", "Local Shell", "cmd"] },
+{"name": "Open Admin CMD", "cmd": "powershell", "args": ["Start-Process", "cmd", "-Verb", "RunAs"]}
 ]
 }

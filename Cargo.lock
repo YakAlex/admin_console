@@ -19,6 +19,7 @@ dependencies = [
  "encoding_rs",
  "notify-rust",
  "ratatui",
+ "rayon",
  "serde",
  "serde_json",
  "sysinfo",
