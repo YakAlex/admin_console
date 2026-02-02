@@ -2,6 +2,18 @@
 "targets": [
 { "name": "Google DNS", "address": "8.8.8.8:53" },
 { "name": "Punkt Nez", "address": "91.142.174.34:80" },
+{ "name": "Kiev-dc1", "address": "192.168.244.86:3389" },
+{ "name": "Kiev-dc2", "address": "192.168.244.88:3389" },
+{ "name": "Dbserv2", "address": "192.168.244.74:3389" },
+{ "name": "Websvr2", "address": "192.168.244.9:3389" },
+{ "name": "Mailsvr", "address": "192.168.244.16:3389" },
+{ "name": "Comp-backup", "address": "192.168.244.39:3389" },
+{ "name": "Esxi", "address": "192.168.244.12:3389" },
+{ "name": "Qview", "address": "192.168.244.8:3389" },
+{ "name": "Zabbix", "address": "192.168.244.69:3389" },
+{ "name": "Joomla", "address": "192.168.244.4:3389" },
+{ "name": "Punkt Nezlam", "address": "91.142.174.34:80" },
+
 { "name": "Local Router", "address": "192.168.0.1:80" }
 ],
 "commands": [
