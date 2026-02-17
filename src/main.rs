@@ -53,6 +53,11 @@ fn main() -> Result<()> {
         let tasks_data = fs::read_to_string(tasks_path).unwrap_or_else(|_| "[]".to_string());
         tasks = serde_json::from_str(&tasks_data).unwrap_or(Vec::new());
     }
+    else {
+        // Якщо ми успішно прочитали todo.txt, відразу оновимо tasks.json,
+        // щоб вони були синхронізовані з першої секунди роботи.
+        let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default());
+    }
 
     let mut list_state = ListState::default();
     if !config.commands.is_empty() { list_state.select(Some(0)); }
@@ -73,9 +78,13 @@ fn main() -> Result<()> {
     // Ми просто викликаємо функцію, передаючи туди копії даних
     start_monitor(config.targets.clone(), tasks.clone(), tx.clone(), rx_from_main);
 
-    enable_raw_mode()?;
+    let is_raw_mode = enable_raw_mode().is_ok();
+
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Якщо raw mode увімкнувся, то вмикаємо і інші фічі, інакше - ні
+    if is_raw_mode {
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -340,8 +349,10 @@ fn main() -> Result<()> {
     for (i, filename) in file_names.iter().enumerate() { let text_to_save = textareas[i].lines().join("\n"); fs::write(filename, text_to_save)?; }
     if tasks_modified { let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default()); }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    if is_raw_mode {
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    }
     terminal.show_cursor()?;
     Ok(())
 }
