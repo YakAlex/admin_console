@@ -1,24 +1,13 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Table, Row, Cell, Tabs, TableState, Clear},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Table, Row, Cell, Tabs, Clear},
     style::{Color, Modifier, Style},
 };
-use tui_textarea::TextArea;
-use crate::types::{ServerStatus, ActiveView, EditorMode, Task, WizardStep};
-use crate::config::AdminCommand;
+use crate::types::{ActiveView, WizardStep};
 use crate::utils::centered_rect;
+use crate::app::App; // <--- Використовуємо App
 
-pub fn draw(
-    f: &mut Frame,
-    textareas: &Vec<TextArea>,
-    server_data: &Vec<ServerStatus>,
-    tasks: &Vec<Task>,
-    active_view: &ActiveView,
-    table_state: &mut TableState,
-    list_state: &mut ListState,
-    commands: &Vec<AdminCommand>,
-    titles: &Vec<&str>,
-) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -30,9 +19,11 @@ pub fn draw(
         .split(main_chunks[0]);
 
     // --- TABLE (SERVERS) ---
+    // Використовуємо app.server_data
     let header_cells = ["Server", "Ping", "Status"].iter().map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
-    let rows = server_data.iter().map(|item| {
+
+    let rows = app.server_data.iter().map(|item| {
         let ping_text = if item.is_online { format!("{}ms", item.latency) } else { "---".to_string() };
         let status_symbol = if item.is_online { "🟢" } else { "🔴" };
         let color = if !item.is_online { Color::Red } else if item.latency > 100 { Color::Yellow } else { Color::Green };
@@ -43,13 +34,17 @@ pub fn draw(
         ];
         Row::new(cells).height(1)
     });
+
     let table = Table::new(rows, [Constraint::Percentage(50), Constraint::Percentage(30), Constraint::Min(10)])
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(" 📡 Servers "));
-    f.render_stateful_widget(table, left_chunks[0], table_state);
+
+    // Використовуємо app.table_state
+    f.render_stateful_widget(table, left_chunks[0], &mut app.table_state);
 
     // --- SCHEDULE (LEFT BOTTOM) ---
-    let mut active_tasks: Vec<&Task> = tasks.iter().filter(|t| !t.completed).collect();
+    // Використовуємо app.tasks
+    let mut active_tasks: Vec<&crate::types::Task> = app.tasks.iter().filter(|t| !t.completed).collect();
     active_tasks.sort_by(|a, b| {
         let a_has_time = !a.time.is_empty();
         let b_has_time = !b.time.is_empty();
@@ -88,15 +83,17 @@ pub fn draw(
     // --- RIGHT SIDE (TABS & CONTENT) ---
     let right_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0)]).split(main_chunks[1]);
 
-    let (current_file_idx, is_actions_active) = match active_view {
-        ActiveView::Editor(mode) => (*mode as usize, false),
-        ActiveView::Search { mode_return_to, .. } => (*mode_return_to as usize, false),
+    // Використовуємо app.active_view
+    let (current_file_idx, is_actions_active) = match app.active_view {
+        ActiveView::Editor(mode) => (mode as usize, false),
+        ActiveView::Search { mode_return_to, .. } => (mode_return_to as usize, false),
         ActiveView::Actions => (0, true),
         ActiveView::InputPopup { .. } => (0, true),
         ActiveView::TodoWizard { .. } => (1, true),
     };
 
-    let file_tabs = Tabs::new(titles.clone())
+    // Використовуємо app.titles
+    let file_tabs = Tabs::new(app.titles.clone())
         .block(Block::default().borders(Borders::BOTTOM))
         .select(if !is_actions_active { current_file_idx } else { 99 })
         .highlight_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
@@ -106,35 +103,38 @@ pub fn draw(
     f.render_widget(action_status, Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(70), Constraint::Percentage(30)]).split(right_chunks[0])[1]);
 
     // --- CONTENT SWITCHER ---
-    match active_view {
+    match &app.active_view {
         ActiveView::Editor(mode) | ActiveView::Search { mode_return_to: mode, .. } => {
-            f.render_widget(&textareas[*mode as usize], right_chunks[1]);
+            // Використовуємо app.textareas
+            f.render_widget(&app.textareas[*mode as usize], right_chunks[1]);
         }
         ActiveView::Actions | ActiveView::InputPopup { .. } => {
-            let items: Vec<ListItem> = commands.iter().map(|i| ListItem::new(i.name.clone()).style(Style::default().fg(Color::White))).collect();
+            // Використовуємо app.config.commands
+            let items: Vec<ListItem> = app.config.commands.iter().map(|i| ListItem::new(i.name.clone()).style(Style::default().fg(Color::White))).collect();
             let list = List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(" Оберіть команду "))
                 .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
                 .highlight_symbol(">> ");
-            f.render_stateful_widget(list, right_chunks[1], list_state);
+            // Використовуємо app.list_state
+            f.render_stateful_widget(list, right_chunks[1], &mut app.list_state);
         }
         ActiveView::TodoWizard { .. } => {
-            f.render_widget(&textareas[1], right_chunks[1]);
+            f.render_widget(&app.textareas[1], right_chunks[1]);
         }
     }
 
     // --- POPUPS ---
-    if let ActiveView::Search { query, .. } = active_view {
+    if let ActiveView::Search { query, .. } = &app.active_view {
         let search_area = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(0), Constraint::Length(3)]).split(right_chunks[1])[1];
         f.render_widget(Clear, search_area);
         f.render_widget(Paragraph::new(format!("Search: {}", query)).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))).style(Style::default().fg(Color::Yellow).bg(Color::Black)), search_area);
     }
-    if let ActiveView::InputPopup { input_buffer, .. } = active_view {
+    if let ActiveView::InputPopup { input_buffer, .. } = &app.active_view {
         let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(input_buffer.clone()).block(Block::default().borders(Borders::ALL).title(" Введіть аргумент (IP/Host) ")).style(Style::default().fg(Color::Yellow).bg(Color::Black)), area);
     }
-    if let ActiveView::TodoWizard { step, buffer, temp_title, .. } = active_view {
+    if let ActiveView::TodoWizard { step, buffer, temp_title, .. } = &app.active_view {
         let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
         let (title, content) = match step {
