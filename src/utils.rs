@@ -1,6 +1,7 @@
 use ratatui::prelude::*;
 use crate::types::Task;
 
+// --- UI Helper ---
 pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -21,59 +22,68 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-// Перевірка, чи ввів користувач правильний час (HH:MM)
-pub fn is_valid_time(input: &str) -> bool {
-    let s = input.trim();
-    if s.is_empty() { return true; } // Пустий час дозволяємо
+// --- LOGIC: Validation ---
+
+/// Перевіряє, чи є рядок коректним часом у форматі HH:MM.
+/// Вимоги: 5 символів, наявність ':', години 0-23, хвилини 0-59.
+pub fn is_valid_time(s: &str) -> bool {
+    if s.len() != 5 { return false; }
 
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 { return false; }
 
-    let h = parts[0].parse::<u8>();
-    let m = parts[1].parse::<u8>();
-
-    match (h, m) {
-        (Ok(hours), Ok(minutes)) => hours < 24 && minutes < 60,
+    match (parts[0].parse::<u8>(), parts[1].parse::<u8>()) {
+        (Ok(h), Ok(m)) => h < 24 && m < 60,
         _ => false,
     }
 }
 
-// Головна функція синхронізації: Текст -> Список завдань
+// --- LOGIC: Parsing ---
+
+/// Парсить текст файлу todo.txt у структуру Task.
+/// Реалізує стійкість до помилок: невалідний час не зникає, а стає частиною тексту.
 pub fn parse_tasks_from_text(content: &str) -> Vec<Task> {
     let mut tasks = Vec::new();
+    // Використовуємо Option, щоб коректно обробляти багаторядкові описи
     let mut current_task: Option<Task> = None;
 
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        // Шукаємо початок завдання "- ["
+        // Шукаємо початок нового завдання "- ["
         if let Some(start_bracket) = trimmed.find("- [") {
-            // Якщо ми парсили попереднє завдання, зберігаємо його
-            if let Some(t) = current_task.take() { tasks.push(t); }
+            // 1. Якщо ми вже парсили завдання, зберігаємо його в список
+            if let Some(t) = current_task.take() {
+                tasks.push(t);
+            }
 
-            let rest = &trimmed[start_bracket + 3..]; // Пропускаємо "- ["
+            let rest = &trimmed[start_bracket + 3..]; // Обрізаємо "- ["
 
-            // Шукаємо закриваючу дужку
+            // Шукаємо закриваючу дужку ']'
             if let Some(end_bracket) = rest.find(']') {
-                let content_inside = &rest[..end_bracket]; // Це "14:00", "x", " " тощо
-                let title_part = &rest[end_bracket + 1..].trim();
+                let content_inside = rest[..end_bracket].trim(); // Те, що в дужках
+                let description_part = rest[end_bracket + 1..].trim(); // Те, що після дужок
 
-                // 1. Визначаємо статус виконання
-                // Якщо всередині є 'x' або 'X' — завдання виконане
-                let completed = content_inside.to_lowercase().contains('x');
+                let mut time = String::new();
+                let mut completed = false;
+                let mut title = description_part.to_string();
 
-                // 2. Визначаємо час
-                // Якщо це не 'x' і не пусто, пробуємо парсити як час
-                let time = if !completed && !content_inside.trim().is_empty() {
-                    content_inside.trim().to_string()
-                } else {
-                    String::new()
-                };
+                // ЛОГІКА ОБРОБКИ СТАТУСУ ТА ЧАСУ
+                if content_inside.eq_ignore_ascii_case("x") {
+                    completed = true;
+                } else if is_valid_time(content_inside) {
+                    // Тільки якщо це ДІЙСНО час (наприклад, 14:00), ми його плануємо
+                    time = content_inside.to_string();
+                } else if !content_inside.is_empty() {
+                    // Якщо там написано "25:00" або "abc", це не час.
+                    // Ми повертаємо це в назву, щоб користувач бачив свою помилку.
+                    title = format!("[{}] {}", content_inside, title);
+                }
 
                 current_task = Some(Task {
-                    title: title_part.to_string(),
-                    description: String::new(), // Опис поки пустий, заповнимо далі якщо є
+                    title,
+                    description: String::new(),
                     time,
                     completed,
                 });
@@ -81,11 +91,17 @@ pub fn parse_tasks_from_text(content: &str) -> Vec<Task> {
         }
         // Якщо рядок не починається з "- [", це продовження опису попереднього завдання
         else if let Some(ref mut t) = current_task {
-            if !t.description.is_empty() { t.description.push('\n'); }
+            if !t.description.is_empty() {
+                t.description.push('\n');
+            }
             t.description.push_str(trimmed);
         }
     }
 
-    if let Some(t) = current_task { tasks.push(t); }
+    // Не забуваємо додати останнє завдання
+    if let Some(t) = current_task {
+        tasks.push(t);
+    }
+
     tasks
 }

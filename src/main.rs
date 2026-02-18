@@ -2,7 +2,9 @@ mod config;
 mod types;
 mod utils;
 mod monitor; // <--- Підключаємо модуль
-mod ui;      // <--- Підключаємо модуль
+mod ui;
+mod app;
+// <--- Підключаємо модуль
 
 use anyhow::Result;
 use crossterm::{
@@ -32,6 +34,9 @@ fn main() -> Result<()> {
     let mut textareas = Vec::new();
     for filename in &file_names {
         let content = fs::read_to_string(filename).unwrap_or_default();
+        if fs::metadata(filename).is_err() {
+            fs::write(filename, &content).ok();
+        }
         let mut ta = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         ta.set_max_histories(10000);
         ta.set_block(Block::default().borders(Borders::ALL));
@@ -40,24 +45,32 @@ fn main() -> Result<()> {
     }
 
     let config_path = "config.json";
-    let config_data = fs::read_to_string(config_path).unwrap_or_else(|_| r#"{ "targets": [], "commands": [] }"#.to_string());
-    let config: AppConfig = serde_json::from_str(&config_data).unwrap_or(AppConfig { targets: vec![], commands: vec![] });
-
+    let config_data = fs::read_to_string(config_path).unwrap_or_else(|_| { r#"{ "targets": [], "commands": [] }"#.to_string() });
+    let config: AppConfig = serde_json::from_str(&config_data).unwrap_or_else(|_| { AppConfig { targets: vec![], commands: vec![] } });
     // --- ЗАВАНТАЖЕННЯ ДАНИХ (Sync Text -> JSON) ---
     let todo_content = fs::read_to_string("todo.txt").unwrap_or_default();
     let mut tasks = parse_tasks_from_text(&todo_content);
 
-    // Резерв: якщо todo.txt пустий, пробуємо взяти з json
-    if tasks.is_empty() {
+    // Якщо todo.txt ВЗАГАЛІ НЕ ІСНУЄ (або ми не змогли його прочитати) - тоді ліземо в JSON.
+    // А якщо він існує, але пустий (tasks.is_empty()) - значить користувач видалив всі задачі.
+
+    // Для цього нам треба знати, чи був файл todo.txt успішно прочитаний.
+    // Змінимо логіку завантаження трохи вище:
+
+    let todo_exists = std::path::Path::new("todo.txt").exists();
+    let todo_content = fs::read_to_string("todo.txt").unwrap_or_default();
+    let mut tasks = parse_tasks_from_text(&todo_content);
+
+    // Логіка резерву: Тільки якщо todo.txt НЕМАЄ, ми беремо дані з JSON.
+    // Якщо todo.txt Є, але пустий -> tasks буде пустим, і ми перезапишемо JSON пустим списком (що нам і треба).
+    if !todo_exists && tasks.is_empty() {
         let tasks_path = "tasks.json";
         let tasks_data = fs::read_to_string(tasks_path).unwrap_or_else(|_| "[]".to_string());
         tasks = serde_json::from_str(&tasks_data).unwrap_or(Vec::new());
     }
-    else {
-        // Якщо ми успішно прочитали todo.txt, відразу оновимо tasks.json,
-        // щоб вони були синхронізовані з першої секунди роботи.
-        let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default());
-    }
+
+    // Далі йде збереження в JSON
+    let _ = fs::write("tasks.json", serde_json::to_string_pretty(&tasks).unwrap_or_default());
 
     let mut list_state = ListState::default();
     if !config.commands.is_empty() { list_state.select(Some(0)); }
